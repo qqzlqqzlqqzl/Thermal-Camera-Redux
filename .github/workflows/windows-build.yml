@@ -101,8 +101,26 @@ jobs:
             $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
             Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
             Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
-            & (Join-Path $depsDir 'Dependencies.exe') -chain .\Thermal-Camera-Redux.exe
-            Get-ChildItem -Recurse | Sort-Object FullName | Format-Table FullName, Length
+            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain .\Thermal-Camera-Redux.exe | ConvertFrom-Json
+            $unresolved = New-Object System.Collections.Generic.List[string]
+            function Find-UnresolvedDependency($node, $parent) {
+              if (-not $node.Filepath) {
+                $unresolved.Add("parent=$parent module=$($node.ModuleName) strategy=$($node.SearchStrategy)")
+              }
+              foreach ($child in @($node.Dependencies)) {
+                Find-UnresolvedDependency $child $node.ModuleName
+              }
+            }
+            Find-UnresolvedDependency $depJson.Root '<root>'
+            if ($unresolved.Count -eq 0) {
+              Write-Host 'DEP_UNRESOLVED none'
+            } else {
+              $unresolved | Sort-Object -Unique | ForEach-Object { Write-Host "DEP_UNRESOLVED $_" }
+            }
+            $files = Get-ChildItem -Recurse -File
+            $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+            Write-Host "Runtime files: count=$($files.Count) bytes=$totalBytes"
+            $files | Sort-Object Length -Descending | Select-Object -First 20 FullName, Length | Format-Table FullName, Length
             exit $status
           }
 
