@@ -7,4 +7,5 @@ if "%DEVICE_INDEX%"=="" (
 ) else (
   shift
 )
+echo UTi260B mode: auto-selecting USB\VID_0BDA^&PID_3901 when present.
 "%DIR%Thermal-Camera-Redux.exe" -uti260b -d %DEVICE_INDEX% %*

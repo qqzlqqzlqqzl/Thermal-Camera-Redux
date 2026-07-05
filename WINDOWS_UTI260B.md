@@ -14,22 +14,41 @@ used by `USB\VID_0BDA&PID_3901`.
 - Do not redistribute the full OpenCV SDK, headers, import libraries, or MSYS2
   package cache with the runtime folder.
 - The Windows CI build compiles a minimal OpenCV with Win32 UI and DirectShow
-  enabled, while Qt, FFmpeg, GStreamer, Media Foundation, OpenCL, tests, docs,
-  Python, Java, and examples are disabled to keep the runtime small.
+  enabled, while Qt, FFmpeg, GStreamer, OpenCL, tests, docs, Python, Java, and
+  examples are disabled to keep the runtime small.
+- UTi260B capture on Windows uses the app's Media Foundation raw YUY2 path,
+  because OpenCV/DirectShow can expose this device as converted RGB and corrupt
+  the thermal matrix.
 
 ## Run
 
 From the extracted artifact folder:
 
 ```bat
-run_uti260b_windows.cmd 0
+run_uti260b_windows.cmd
 ```
 
-If the thermal camera is not device index `0`, try `1`, `2`, and so on.
+In `-uti260b` mode the Windows build auto-selects the camera whose device path
+contains `VID_0BDA` and `PID_3901`. The optional numeric argument is retained for
+the generic camera-index CLI shape, but it is not used to choose between the
+laptop camera and the UTi260B profile when this VID/PID is present.
+
 The launcher expands to:
 
 ```bat
 Thermal-Camera-Redux.exe -uti260b -d <device-index>
+```
+
+The tested Windows device list was:
+
+- `USB Camera`: `USB\VID_0BDA&PID_3901&MI_00\...`
+- `HP HD Camera`: `USB\VID_04F2&PID_B6C0&MI_00\...`
+
+The runtime log should include:
+
+```text
+Media Foundation selected VID_0BDA&PID_3901 camera index 1: USB Camera
+Backend: MediaFoundation raw YUY2 256x386 stride(512)
 ```
 
 ## Camera profile

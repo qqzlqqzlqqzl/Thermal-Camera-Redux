@@ -382,6 +382,59 @@ static std::wstring allocatedMfString(IMFActivate *activate, REFGUID key) {
 	return result;
 }
 
+static std::wstring mfGuidString(const GUID &guid) {
+	WCHAR value[64] = {0};
+	if ( 0 < StringFromGUID2(guid, value, ARRAY_COUNT(value)) ) {
+		return std::wstring(value);
+	}
+	return L"(unknown guid)";
+}
+
+static void printMfVideoDevices(IMFActivate **devices, UINT32 deviceCount) {
+	printf("Media Foundation video devices:\n");
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		std::wstring symbolicLink = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+		std::wstring friendlyName = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+		printf("  [%u] %ls\n      %ls\n",
+			i,
+			friendlyName.empty() ? L"(no friendly name)" : friendlyName.c_str(),
+			symbolicLink.empty() ? L"(no symbolic link)" : symbolicLink.c_str());
+	}
+}
+
+static void printMfNativeMediaTypes(IMFSourceReader *sourceReader) {
+	printf("Media Foundation native video formats for selected camera:\n");
+	for (DWORD i = 0; ; i++) {
+		IMFMediaType *nativeType = NULL;
+		HRESULT hr = sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
+		if ( MF_E_NO_MORE_TYPES == hr ) {
+			break;
+		}
+		if ( FAILED(hr) ) {
+			printf("  [%lu] GetNativeMediaType failed: 0x%08lx\n", (unsigned long)i, (unsigned long)hr);
+			break;
+		}
+
+		GUID subtype = {};
+		UINT32 typeWidth = 0;
+		UINT32 typeHeight = 0;
+		UINT32 fpsNumerator = 0;
+		UINT32 fpsDenominator = 0;
+		nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
+		MFGetAttributeSize(nativeType, MF_MT_FRAME_SIZE, &typeWidth, &typeHeight);
+		MFGetAttributeRatio(nativeType, MF_MT_FRAME_RATE, &fpsNumerator, &fpsDenominator);
+		std::wstring guid = mfGuidString(subtype);
+
+		printf("  [%lu] subtype(%ls %ls) size(%ux%u) fps(%u/%u)\n",
+			(unsigned long)i,
+			IsEqualGUID(MFVideoFormat_YUY2, subtype) ? L"YUY2" : L"other",
+			guid.c_str(),
+			typeWidth, typeHeight,
+			fpsNumerator, fpsDenominator);
+		nativeType->Release();
+	}
+}
+
 class WindowsRawVideoCapture {
 public:
 	bool open(int requestedIndex, bool preferUTi260B);
@@ -458,6 +511,7 @@ bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
 	if ( preferUTi260B && selected < 0 ) {
 		printf("%sMedia Foundation could not find USB\\VID_0BDA&PID_3901 among %u video devices\n%s",
 			RED_STR(), deviceCount, RESET_STR());
+		printMfVideoDevices(devices, deviceCount);
 		for (UINT32 i = 0; i < deviceCount; i++) {
 			devices[i]->Release();
 		}
@@ -535,6 +589,7 @@ bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
 	if ( ! selectedType ) {
 		printf("%sMedia Foundation could not find YUY2 %dx%d mode for selected camera\n%s",
 			RED_STR(), FIXED_TC_WIDTH, cameraCaptureRows, RESET_STR());
+		printMfNativeMediaTypes(sourceReader);
 		safeRelease(&sourceReader);
 		safeRelease(&mediaSource);
 		release();
@@ -5400,23 +5455,23 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 //	cap.get(cv::CAP_PROP_HW_ACCELERATION),
 	if ( cap.isOpened() ) {
 		cout << "Backend: " << cap.getBackendName() << endl;
+		printf("fps(%.2f) mode(%.2f) foc(%.2f) br(%.2f) fmt(%.2f) gamma(%.2f) sharp(%.2f) temp(%.2f) hue(%.2f) gain(%.2f) contrast(%.2f) bright(%.2f) exposure(%.2f) saturation(%.2f)\n",
+			cap.get(CAP_PROP_FPS),
+			cap.get(CAP_PROP_MODE),
+			cap.get(CAP_PROP_FOCUS),
+			cap.get(CAP_PROP_BITRATE),
+			cap.get(CAP_PROP_CODEC_PIXEL_FORMAT),
+			cap.get(CAP_PROP_GAMMA),
+			cap.get(CAP_PROP_SHARPNESS),
+			cap.get(CAP_PROP_TEMPERATURE),
+			cap.get(CAP_PROP_HUE),
+			cap.get(CAP_PROP_GAIN),
+			cap.get(CAP_PROP_CONTRAST),
+			cap.get(CAP_PROP_BRIGHTNESS),
+			cap.get(CAP_PROP_EXPOSURE),
+			cap.get(CAP_PROP_SATURATION)
+			);
 	}
-	printf("fps(%.2f) mode(%.2f) foc(%.2f) br(%.2f) fmt(%.2f) gamma(%.2f) sharp(%.2f) temp(%.2f) hue(%.2f) gain(%.2f) contrast(%.2f) bright(%.2f) exposure(%.2f) saturation(%.2f)\n", 
-		cap.get(CAP_PROP_FPS),
-		cap.get(CAP_PROP_MODE),
-		cap.get(CAP_PROP_FOCUS),
-		cap.get(CAP_PROP_BITRATE),
-		cap.get(CAP_PROP_CODEC_PIXEL_FORMAT),
-		cap.get(CAP_PROP_GAMMA),
-		cap.get(CAP_PROP_SHARPNESS),
-		cap.get(CAP_PROP_TEMPERATURE),
-		cap.get(CAP_PROP_HUE),
-		cap.get(CAP_PROP_GAIN),
-		cap.get(CAP_PROP_CONTRAST),
-		cap.get(CAP_PROP_BRIGHTNESS),
-		cap.get(CAP_PROP_EXPOSURE),
-		cap.get(CAP_PROP_SATURATION)
-		);
 	return 1;
 }
 
