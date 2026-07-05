@@ -32,6 +32,7 @@ jobs:
           set -euxo pipefail
           curl -L --retry 5 -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"
           unzip -q opencv.zip
+          sed -i -E 's/cmake_minimum_required\(VERSION [0-9.]+\)/cmake_minimum_required(VERSION 3.5)/' "opencv-${OPENCV_VERSION}/cmake/OpenCVGenPkgconfig.cmake"
           cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/opencv-install" \
