@@ -13,6 +13,9 @@
 #include <chrono>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <io.h>
 #ifndef F_OK
@@ -338,6 +341,7 @@ static float rulerXKelvinFactor;
 static float rulerYKelvinFactor;
 
 static const char *Argv0  = "";
+static int cameraIndex = 0;
 
 // Reuse Point to minimize construction/destruction overhead
 #ifdef POINT
@@ -4929,37 +4933,75 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 		return -1;
 	}
 
-	if ( FIXED_TC_WIDTH != captureFrame.cols ||
-	     CV_8UC2 != captureFrame.type() ||
-	     2 != captureFrame.channels() ) {
-		printf("%sUnsupported frame: cols(%d) rows(%d) type(%d) channels(%d). Expected %dx%d or %dx%d CV_8UC2 YUYV.\n%s",
-			RED_STR(),
-			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
-			FIXED_TC_WIDTH, RAW_TC_ROWS,
-			FIXED_TC_WIDTH, UTI260B_CAPTURE_ROWS,
-			RESET_STR());
-		return -1;
-	}
+	Mat frame = captureFrame.isContinuous() ? captureFrame : captureFrame.clone();
 
-	if ( RAW_TC_ROWS == captureFrame.rows ) {
-		rawFrame = captureFrame;
-		return 0;
-	}
-
-	if ( UTI260B_CAPTURE_ROWS == captureFrame.rows ) {
-		Mat visibleRows = captureFrame( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
+	if ( CV_8UC2 == frame.type() &&
+	     frame.cols >= FIXED_TC_WIDTH &&
+	     frame.rows >= RAW_TC_ROWS ) {
+		Mat visibleRows = frame( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
 		visibleRows.copyTo(rawFrame);
 		return 0;
 	}
 
-	printf("%sUnsupported frame height %d. Expected %d for TC001/P2 or %d for UTi260B 0BDA:3901.\n%s",
-		RED_STR(), captureFrame.rows, RAW_TC_ROWS, UTI260B_CAPTURE_ROWS, RESET_STR());
+	size_t byteCount = frame.total() * frame.elemSize();
+	int candidateRows[] = { cameraCaptureRows, UTI260B_CAPTURE_ROWS, RAW_TC_ROWS };
+	for (int i = 0; i < ARRAY_COUNT(candidateRows); i++) {
+		int rows = candidateRows[i];
+		if ( rows < RAW_TC_ROWS || 0 != (byteCount % rows) ) {
+			continue;
+		}
+
+		size_t bytesPerRow = byteCount / rows;
+		if ( 0 != (bytesPerRow % 2) ) {
+			continue;
+		}
+
+		int pixelsPerRow = (int)(bytesPerRow / 2);
+		if ( pixelsPerRow < FIXED_TC_WIDTH ) {
+			continue;
+		}
+
+		Mat yuyvRows(rows, pixelsPerRow, CV_8UC2, frame.data);
+		Mat visibleRows = yuyvRows( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
+		visibleRows.copyTo(rawFrame);
+		return 0;
+	}
+
+	printf("%sUnsupported frame: cols(%d) rows(%d) type(%d) channels(%d) bytes(%zu). Expected raw YUYV %dx%d or %dx%d.\n%s",
+		RED_STR(),
+		captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(), byteCount,
+		FIXED_TC_WIDTH, RAW_TC_ROWS,
+		FIXED_TC_WIDTH, UTI260B_CAPTURE_ROWS,
+		RESET_STR());
 	return -1;
+}
+
+void configureCapture( VideoCapture &cap ) {
+#ifdef _WIN32
+	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','2'));
+#else
+	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','V'));
+#endif
+	cap.set(CAP_PROP_FRAME_WIDTH,  FIXED_TC_WIDTH);
+	cap.set(CAP_PROP_FRAME_HEIGHT, cameraCaptureRows);
+	cap.set(CAP_PROP_FPS, offline_fps);
+	cap.set(CAP_PROP_CONVERT_RGB, 0.0);
+	cap.set(CAP_PROP_MONOCHROME,  1.0);
 }
 
 int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
-#if 1
+#ifdef _WIN32
+	int backends[] = { CAP_DSHOW, CAP_MSMF, CAP_ANY };
+	for (int i = 0; i < ARRAY_COUNT(backends); i++) {
+		cap.release();
+		cap.open(cameraIndex, backends[i]);
+		if ( cap.isOpened() ) {
+			configureCapture(cap);
+			break;
+		}
+	}
+#elif 1
   	cap = VideoCapture(camera, CAP_V4L); // CAP_V4L dictates frame buffer size and format 
 #else
   	cap = VideoCapture(camera, CAP_FFMPEG); // CAP_FFMPEG dictates frame buffer size and format 
@@ -4973,12 +5015,7 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 	// V4L - Video for Linux
 	// RGB needed for thermal data
 	// Convert to COLOR_YUV2BGR_YUYV for playback
-	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','V'));
-	cap.set(CAP_PROP_FRAME_WIDTH,  FIXED_TC_WIDTH);
-	cap.set(CAP_PROP_FRAME_HEIGHT, cameraCaptureRows);
-	cap.set(CAP_PROP_FPS, offline_fps);
-	cap.set(CAP_PROP_CONVERT_RGB, 0.0); 
-	cap.set(CAP_PROP_MONOCHROME,  1.0); 
+	configureCapture(cap);
 	// TODO-FIXME - Investigate CAP_PROP_FORMAT and -1 for raw
 	// Can it be set CV_8UC2, 1 channel of unsigned short
 
@@ -5137,7 +5174,12 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 		} else if (( ! strcmp( argv[i], "-d"      ) ||
 			     ! strcmp( argv[i], "-device" ) ) && hasNext ) {
 			threadData.source    = "Camera";
+#ifdef _WIN32
+			cameraIndex = abs( atoi(argv[i + 1]) );
+			sprintf( camera, "%d", cameraIndex );
+#else
 			sprintf( camera, "/dev/video%d", abs( atoi(argv[i + 1]) ) ); // Default is camera 0
+#endif
 			threadData.inputFile = 0;
 			if ( ! quietStdout ) {
 //				printf("%s(%d): Opening camera %s\n", __func__,__LINE__, camera ); FF();

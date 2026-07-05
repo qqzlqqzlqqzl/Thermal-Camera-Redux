@@ -1,0 +1,49 @@
+name: Windows build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-opencv
+
+      - name: Build redux.exe
+        working-directory: src
+        run: |
+          set -euxo pipefail
+          DEFAULT_FLAGS='-DBORDER_LAYOUT=0 -DDEFAULT_FONT=0 -DDEFAULT_COLORMAP=4 -DROTATION=0 -DDISPLAY_WIDTH=2560 -DDISPLAY_HEIGHT=1600 -DUSE_CELSIUS=0 -DHUD_ALPHA=0.4'
+          CFLAGS='-march=x86-64 -mtune=generic -pipe -fomit-frame-pointer'
+          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 -I/ucrt64/include/opencv4 tc001.cpp thread.cpp -o redux.exe -lpthread $(pkg-config --cflags --libs opencv4)
+          ./redux.exe -help || test "$?" -eq 255
+
+      - name: Package runtime DLLs
+        working-directory: src
+        run: |
+          set -euxo pipefail
+          mkdir -p ../dist/windows-x64
+          cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
+          cp ../run_uti260b_windows.cmd ../dist/windows-x64/
+          ldd redux.exe | awk '/\/ucrt64\// { print $3 }' | sort -u | while read -r dll; do
+            cp -n "$dll" ../dist/windows-x64/
+          done
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermal-camera-redux-windows-x64
+          path: dist/windows-x64/
