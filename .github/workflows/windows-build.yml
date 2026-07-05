@@ -15,12 +15,12 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: MINGW64
           update: true
           install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-opencv
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-opencv
 
       - name: Build redux.exe
         working-directory: src
@@ -53,7 +53,7 @@ jobs:
                   continue
                 fi
                 local dll_path
-                dll_path="$(find /ucrt64/bin -maxdepth 1 -iname "$dll_name" -print -quit)"
+                dll_path="$(find "$MINGW_PREFIX/bin" -maxdepth 1 -iname "$dll_name" -print -quit)"
                 if [ -z "$dll_path" ]; then
                   continue
                 fi
@@ -64,11 +64,11 @@ jobs:
             done
           }
           copy_mingw_deps redux.exe
-          find /ucrt64/bin -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
+          find "$MINGW_PREFIX/bin" -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
           find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
             copy_mingw_deps "$plugin"
           done
-          for qt_plugins in /ucrt64/share/qt6/plugins /ucrt64/share/qt5/plugins; do
+          for qt_plugins in "$MINGW_PREFIX/share/qt6/plugins" "$MINGW_PREFIX/share/qt5/plugins"; do
             if [ -f "$qt_plugins/platforms/qwindows.dll" ]; then
               mkdir -p ../dist/windows-x64/platforms
               cp -n "$qt_plugins/platforms/qwindows.dll" ../dist/windows-x64/platforms/
