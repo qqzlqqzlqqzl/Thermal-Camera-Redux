@@ -11,6 +11,10 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <chrono>
+#include <algorithm>
+#include <string>
+#include <cwctype>
+#include <string.h>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -18,6 +22,10 @@
 #endif
 #include <windows.h>
 #include <io.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
 #ifndef F_OK
 #define F_OK 0
 #endif
@@ -346,6 +354,286 @@ static float rulerYKelvinFactor;
 
 static const char *Argv0  = "";
 static int cameraIndex = 0;
+
+#ifdef _WIN32
+template <class T>
+static void safeRelease(T **ppT) {
+	if ( ppT && *ppT ) {
+		(*ppT)->Release();
+		*ppT = NULL;
+	}
+}
+
+static std::wstring lowerWide(const std::wstring &value) {
+	std::wstring result = value;
+	std::transform(result.begin(), result.end(), result.begin(),
+		[](wchar_t ch) { return (wchar_t)towlower(ch); });
+	return result;
+}
+
+static std::wstring allocatedMfString(IMFActivate *activate, REFGUID key) {
+	WCHAR *value = NULL;
+	UINT32 length = 0;
+	std::wstring result;
+	if ( SUCCEEDED(activate->GetAllocatedString(key, &value, &length)) && value ) {
+		result.assign(value, length);
+	}
+	CoTaskMemFree(value);
+	return result;
+}
+
+class WindowsRawVideoCapture {
+public:
+	bool open(int requestedIndex, bool preferUTi260B);
+	bool read(Mat &dst);
+	void release();
+	bool isOpened() const { return opened; }
+
+private:
+	IMFMediaSource *source = NULL;
+	IMFSourceReader *reader = NULL;
+	UINT32 width = FIXED_TC_WIDTH;
+	UINT32 height = UTI260B_CAPTURE_ROWS;
+	LONG stride = FIXED_TC_WIDTH * 2;
+	bool opened = false;
+	bool mfStarted = false;
+	bool comStarted = false;
+};
+
+static WindowsRawVideoCapture windowsRawCapture;
+
+bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
+	release();
+
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if ( SUCCEEDED(hr) ) {
+		comStarted = true;
+	} else if ( RPC_E_CHANGED_MODE != hr ) {
+		printf("%sMedia Foundation COM init failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		return false;
+	}
+
+	hr = MFStartup(MF_VERSION);
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation startup failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+	mfStarted = true;
+
+	IMFAttributes *attributes = NULL;
+	IMFActivate **devices = NULL;
+	UINT32 deviceCount = 0;
+
+	hr = MFCreateAttributes(&attributes, 1);
+	if ( SUCCEEDED(hr) ) {
+		hr = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+	}
+	if ( SUCCEEDED(hr) ) {
+		hr = MFEnumDeviceSources(attributes, &devices, &deviceCount);
+	}
+	safeRelease(&attributes);
+
+	if ( FAILED(hr) || 0 == deviceCount ) {
+		printf("%sMedia Foundation found no video capture devices: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+
+	int selected = -1;
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		std::wstring symbolicLink = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+		std::wstring friendlyName = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+		std::wstring lowered = lowerWide(symbolicLink);
+		if ( preferUTi260B &&
+		     std::wstring::npos != lowered.find(L"vid_0bda") &&
+		     std::wstring::npos != lowered.find(L"pid_3901") ) {
+			selected = (int)i;
+			printf("Media Foundation selected VID_0BDA&PID_3901 camera index %d: %ls\n",
+				selected, friendlyName.c_str());
+			break;
+		}
+	}
+
+	if ( selected < 0 && 0 <= requestedIndex && requestedIndex < (int)deviceCount ) {
+		selected = requestedIndex;
+	}
+
+	if ( selected < 0 ) {
+		printf("%sMedia Foundation could not select camera index %d from %u devices\n%s",
+			RED_STR(), requestedIndex, deviceCount, RESET_STR());
+		for (UINT32 i = 0; i < deviceCount; i++) {
+			devices[i]->Release();
+		}
+		CoTaskMemFree(devices);
+		release();
+		return false;
+	}
+
+	IMFMediaSource *mediaSource = NULL;
+	hr = devices[selected]->ActivateObject(IID_PPV_ARGS(&mediaSource));
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		devices[i]->Release();
+	}
+	CoTaskMemFree(devices);
+
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation camera activation failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+
+	IMFSourceReader *sourceReader = NULL;
+	hr = MFCreateSourceReaderFromMediaSource(mediaSource, NULL, &sourceReader);
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation source reader creation failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	IMFMediaType *selectedType = NULL;
+	for (DWORD i = 0; ; i++) {
+		IMFMediaType *nativeType = NULL;
+		hr = sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
+		if ( MF_E_NO_MORE_TYPES == hr ) {
+			break;
+		}
+		if ( FAILED(hr) ) {
+			break;
+		}
+
+		GUID subtype = GUID_NULL;
+		UINT32 typeWidth = 0;
+		UINT32 typeHeight = 0;
+		nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
+		MFGetAttributeSize(nativeType, MF_MT_FRAME_SIZE, &typeWidth, &typeHeight);
+
+		if ( IsEqualGUID(MFVideoFormat_YUY2, subtype) &&
+		     FIXED_TC_WIDTH == (int)typeWidth &&
+		     cameraCaptureRows == (int)typeHeight ) {
+			selectedType = nativeType;
+			width = typeWidth;
+			height = typeHeight;
+			break;
+		}
+
+		nativeType->Release();
+	}
+
+	if ( ! selectedType ) {
+		printf("%sMedia Foundation could not find YUY2 %dx%d mode for selected camera\n%s",
+			RED_STR(), FIXED_TC_WIDTH, cameraCaptureRows, RESET_STR());
+		safeRelease(&sourceReader);
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	hr = sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, selectedType);
+	if ( SUCCEEDED(hr) ) {
+		UINT32 mediaStride = 0;
+		if ( SUCCEEDED(selectedType->GetUINT32(MF_MT_DEFAULT_STRIDE, &mediaStride)) && 0 != mediaStride ) {
+			stride = (LONG)mediaStride;
+		} else {
+			stride = (LONG)(width * 2);
+		}
+	}
+	selectedType->Release();
+
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation could not set YUY2 %ux%u mode: 0x%08lx\n%s",
+			RED_STR(), width, height, (unsigned long)hr, RESET_STR());
+		safeRelease(&sourceReader);
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	source = mediaSource;
+	reader = sourceReader;
+	opened = true;
+	printf("Backend: MediaFoundation raw YUY2 %ux%u stride(%ld)\n", width, height, stride);
+	return true;
+}
+
+bool WindowsRawVideoCapture::read(Mat &dst) {
+	if ( ! opened || ! reader ) {
+		return false;
+	}
+
+	for (int attempt = 0; attempt < 60; attempt++) {
+		DWORD streamIndex = 0;
+		DWORD flags = 0;
+		LONGLONG timestamp = 0;
+		IMFSample *sample = NULL;
+		HRESULT hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &streamIndex, &flags, &timestamp, &sample);
+		if ( FAILED(hr) ) {
+			printf("%sMedia Foundation ReadSample failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+			return false;
+		}
+		if ( flags & MF_SOURCE_READERF_ENDOFSTREAM ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( ! sample ) {
+			continue;
+		}
+
+		IMFMediaBuffer *buffer = NULL;
+		hr = sample->ConvertToContiguousBuffer(&buffer);
+		if ( FAILED(hr) ) {
+			safeRelease(&sample);
+			continue;
+		}
+
+		BYTE *data = NULL;
+		DWORD maxLength = 0;
+		DWORD currentLength = 0;
+		hr = buffer->Lock(&data, &maxLength, &currentLength);
+		if ( SUCCEEDED(hr) && data ) {
+			dst.create((int)height, (int)width, CV_8UC2);
+			size_t rowBytes = (size_t)width * 2;
+			size_t sourceStride = (size_t)labs(stride);
+			if ( sourceStride < rowBytes ) {
+				sourceStride = rowBytes;
+			}
+			if ( currentLength >= sourceStride * height ) {
+				for (UINT32 row = 0; row < height; row++) {
+					memcpy(dst.ptr((int)row), data + (row * sourceStride), rowBytes);
+				}
+				buffer->Unlock();
+				safeRelease(&buffer);
+				safeRelease(&sample);
+				return true;
+			}
+			buffer->Unlock();
+		}
+		safeRelease(&buffer);
+		safeRelease(&sample);
+	}
+
+	return false;
+}
+
+void WindowsRawVideoCapture::release() {
+	opened = false;
+	safeRelease(&reader);
+	if ( source ) {
+		source->Shutdown();
+		source->Release();
+		source = NULL;
+	}
+	if ( mfStarted ) {
+		MFShutdown();
+		mfStarted = false;
+	}
+	if ( comStarted ) {
+		CoUninitialize();
+		comStarted = false;
+	}
+}
+#endif
 
 // Reuse Point to minimize construction/destruction overhead
 #ifdef POINT
@@ -5021,13 +5309,19 @@ void configureCapture( VideoCapture &cap ) {
 int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
 #ifdef _WIN32
-	int backends[] = { CAP_DSHOW, CAP_MSMF, CAP_ANY };
-	for (int i = 0; i < ARRAY_COUNT(backends); i++) {
-		cap.release();
-		cap.open(cameraIndex, backends[i]);
-		if ( cap.isOpened() ) {
-			configureCapture(cap);
-			break;
+	if ( 0 == strcmp(cameraProfileName, "uti260b-0bda3901") ) {
+		if ( ! windowsRawCapture.open(cameraIndex, true) ) {
+			return -1;
+		}
+	} else {
+		int backends[] = { CAP_DSHOW, CAP_MSMF, CAP_ANY };
+		for (int i = 0; i < ARRAY_COUNT(backends); i++) {
+			cap.release();
+			cap.open(cameraIndex, backends[i]);
+			if ( cap.isOpened() ) {
+				configureCapture(cap);
+				break;
+			}
 		}
 	}
 #elif 1
@@ -5044,12 +5338,19 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 	// V4L - Video for Linux
 	// RGB needed for thermal data
 	// Convert to COLOR_YUV2BGR_YUYV for playback
-	configureCapture(cap);
+	if ( cap.isOpened() ) {
+		configureCapture(cap);
+	}
 	// TODO-FIXME - Investigate CAP_PROP_FORMAT and -1 for raw
 	// Can it be set CV_8UC2, 1 channel of unsigned short
 
 	// Check if camera opened successfully
-	if ( ! cap.isOpened() ) {
+#ifdef _WIN32
+	bool rawCameraOpened = windowsRawCapture.isOpened();
+#else
+	bool rawCameraOpened = false;
+#endif
+	if ( ! cap.isOpened() && ! rawCameraOpened ) {
 		printf( RED_STR() );
 		if ( fileExists( camera ) ) {
 			printf( "\nError opening video stream(%s)\n\n", camera); FF();
@@ -5078,7 +5379,9 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
 // Need 4.8 OpenCV for hardware acceleration
 //	cap.get(cv::CAP_PROP_HW_ACCELERATION),
-	cout << "Backend: " << cap.getBackendName() << endl;
+	if ( cap.isOpened() ) {
+		cout << "Backend: " << cap.getBackendName() << endl;
+	}
 	printf("fps(%.2f) mode(%.2f) foc(%.2f) br(%.2f) fmt(%.2f) gamma(%.2f) sharp(%.2f) temp(%.2f) hue(%.2f) gain(%.2f) contrast(%.2f) bright(%.2f) exposure(%.2f) saturation(%.2f)\n", 
 		cap.get(CAP_PROP_FPS),
 		cap.get(CAP_PROP_MODE),
@@ -5518,12 +5821,40 @@ int mainPrivate (int argc, char *argv[]) {
 				
 					int readError;
 					if (0 == lastGoodFrame) {
+#ifdef _WIN32
+						if ( windowsRawCapture.isOpened() ) {
+							readError = windowsRawCapture.read(tFrame_1) ? 0 : -1;
+						} else {
+							cap >> tFrame_1;
+							readError = normalizeRawFrame(tFrame_1, rawFrame);
+						}
+#else
 						cap >> tFrame_1;
 						readError     = normalizeRawFrame(tFrame_1, rawFrame);
+#endif
+#ifdef _WIN32
+						if ( ! readError && windowsRawCapture.isOpened() ) {
+							readError = normalizeRawFrame(tFrame_1, rawFrame);
+						}
+#endif
 						lastGoodFrame = readError ? 0 : 1;
 					} else {
+#ifdef _WIN32
+						if ( windowsRawCapture.isOpened() ) {
+							readError = windowsRawCapture.read(tFrame_0) ? 0 : -1;
+						} else {
+							cap >> tFrame_0;
+							readError = normalizeRawFrame(tFrame_0, rawFrame);
+						}
+#else
 						cap >> tFrame_0;
 						readError     = normalizeRawFrame(tFrame_0, rawFrame);
+#endif
+#ifdef _WIN32
+						if ( ! readError && windowsRawCapture.isOpened() ) {
+							readError = normalizeRawFrame(tFrame_0, rawFrame);
+						}
+#endif
 						lastGoodFrame = readError ? 1 : 0;
 					}
 
@@ -5534,6 +5865,9 @@ int mainPrivate (int argc, char *argv[]) {
 						printf(RESET_STR());
 						if ( ! released ) {
 							cap.release();
+#ifdef _WIN32
+							windowsRawCapture.release();
+#endif
 							released = 1;
 						}
 						threadData.lostVideo   = 1;
@@ -6005,6 +6339,9 @@ SHUTDOWN:
 	if ( ! released && ! threadData.inputFile ) {
 		// When everything done, release the video capture and write object
 		cap.release();
+#ifdef _WIN32
+		windowsRawCapture.release();
+#endif
 	}
 
 	if ( rawReadFp ) {
