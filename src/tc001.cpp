@@ -22,7 +22,11 @@
 #define F_OK 0
 #endif
 #define access _access
-#define nice(priority) (0)
+static inline int nice(int) { return 0; }
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <opencv2/opencv.hpp>
