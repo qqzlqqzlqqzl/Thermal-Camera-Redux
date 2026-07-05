@@ -48,10 +48,7 @@ jobs:
             if [ -f "$qt_plugins/platforms/qwindows.dll" ]; then
               mkdir -p ../dist/windows-x64/platforms
               cp -n "$qt_plugins/platforms/qwindows.dll" ../dist/windows-x64/platforms/
-              cat > ../dist/windows-x64/qt.conf <<'EOF'
-[Paths]
-Plugins=.
-EOF
+              printf '[Paths]\nPlugins=.\n' > ../dist/windows-x64/qt.conf
             fi
           done
           du -sh ../dist/windows-x64
