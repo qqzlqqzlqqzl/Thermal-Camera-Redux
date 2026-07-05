@@ -1,0 +1,4 @@
+*.sh text eol=lf
+.github/workflows/*.yml text eol=lf
+src/build_redux text eol=lf
+src/build_redux_rpi text eol=lf

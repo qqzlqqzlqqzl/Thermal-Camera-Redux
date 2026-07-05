@@ -287,6 +287,12 @@ void dumpV4L2() {
 // Camera's native resolution
 #define FIXED_TC_WIDTH  	256
 #define FIXED_TC_HEIGHT 	192
+#define RAW_TC_ROWS		(FIXED_TC_HEIGHT * 2)
+#define UTI260B_CAPTURE_ROWS	(RAW_TC_ROWS + 2)
+
+static const char *cameraProfileName = "tc001";
+static int cameraCaptureRows = RAW_TC_ROWS;
+static float kelvinScale = 64.0;
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -859,15 +865,15 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 #else
 
 float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	return ( ((float)kelvin / 64.0) - 273.15 );
+	return ( ((float)kelvin / kelvinScale) - 273.15 );
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
 long celsius2Kelvin(float celsius) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	//  celsius                  = (kelvin / 64.0) - 273.15
-	//  celsius + 273.15         = (kelvin / 64.0)
-	// (celsius + 273.15) * 64.0 = kelvin
-	return ( round((celsius + 273.15)  *  64.0  ) );
+	//  celsius                        = (kelvin / kelvinScale) - 273.15
+	//  celsius + 273.15               = (kelvin / kelvinScale)
+	// (celsius + 273.15) * kelvinScale = kelvin
+	return ( round((celsius + 273.15)  *  kelvinScale  ) );
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
@@ -2929,7 +2935,7 @@ void writeRawFrame(Mat &frame, FILE *fp) {
         unsigned short *data = &((unsigned short *)(frame.datastart))[0];
 
 	// Make sure this is NOT a scaled/composited frame
-	ASSERT(( (FIXED_TC_HEIGHT * 2) == rows ))  // 2 frames
+	ASSERT(( RAW_TC_ROWS == rows ))  // 2 frames
 	ASSERT((  FIXED_TC_WIDTH       == cols ))
 	ASSERT((                     2 == chan ))
 
@@ -2973,7 +2979,7 @@ void readRawFrame(Mat &frame, FILE *fp) {
 	fread( &type,    sizeof(unsigned short), 1, fp );
 	fread( &chan,    sizeof(unsigned short), 1, fp );
 
-	ASSERT(( (FIXED_TC_HEIGHT * 2) == rows ))  // 2 frames
+	ASSERT(( RAW_TC_ROWS == rows ))  // 2 frames
 	ASSERT((  FIXED_TC_WIDTH       == cols ))
 	ASSERT((                     2 == chan ))
 
@@ -2995,7 +3001,7 @@ FILE * readRawFrame(Mat &frame, const char *filename, FILE *fp, int keepOpen, lo
 		return 0x00;
 	}
 
-#define FRAME_SIZE ((4 * sizeof(unsigned short)) + (FIXED_TC_HEIGHT*2*FIXED_TC_WIDTH * sizeof(unsigned short))) 
+#define FRAME_SIZE ((4 * sizeof(unsigned short)) + (RAW_TC_ROWS*FIXED_TC_WIDTH * sizeof(unsigned short)))
 
 	struct stat st;
 	stat(filename, &st);
@@ -3095,7 +3101,7 @@ void printUsage() {
   printf("\n");
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
-  printf( "Optional flags:  [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
+  printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -3153,6 +3159,8 @@ void printInfo() {
 	  DISPLAY_WIDTH, DISPLAY_HEIGHT, MAX_SCALE_STEPS, TC_DEF_SCALE, ROTATION_STR,
 	  USE_CELSIUS?"Celsius":"Fahrenheit", MAX_CMAPS, cmaps[controls.cmapCurrent]->name
        	);
+  printf("    camera profile %s, capture %dx%d, temperature scale %.1f\n",
+	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale);
   printf("    %s-threaded with %s scrolling\n",
 
 #if DRAW_SINGLE_THREAD
@@ -4882,6 +4890,71 @@ void *thermalDataThread( void *ptr ) {
 #endif // if ! DRAW_SINGLE_THREAD /* ] */
 
 
+void setTC001Profile() {
+	cameraProfileName = "tc001";
+	cameraCaptureRows = RAW_TC_ROWS;
+	kelvinScale = 64.0;
+}
+
+void setUTi260BProfile() {
+	cameraProfileName = "uti260b-0bda3901";
+	cameraCaptureRows = UTI260B_CAPTURE_ROWS;
+	kelvinScale = 16.0;
+}
+
+int setCameraProfile(const char *profile) {
+	if ((0 == strcmp(profile, "tc001")) ||
+	    (0 == strcmp(profile, "p2")) ||
+	    (0 == strcmp(profile, "p2pro"))) {
+		setTC001Profile();
+		return 0;
+	}
+
+	if ((0 == strcmp(profile, "uti260b")) ||
+	    (0 == strcmp(profile, "uti260b-0bda3901")) ||
+	    (0 == strcmp(profile, "tiny1b")) ||
+	    (0 == strcmp(profile, "0bda3901"))) {
+		setUTi260BProfile();
+		return 0;
+	}
+
+	printf("%sUnknown camera profile '%s'\n%s", RED_STR(), profile, RESET_STR());
+	return -1;
+}
+
+int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
+	if ( captureFrame.empty() ) {
+		return -1;
+	}
+
+	if ( FIXED_TC_WIDTH != captureFrame.cols ||
+	     CV_8UC2 != captureFrame.type() ||
+	     2 != captureFrame.channels() ) {
+		printf("%sUnsupported frame: cols(%d) rows(%d) type(%d) channels(%d). Expected %dx%d or %dx%d CV_8UC2 YUYV.\n%s",
+			RED_STR(),
+			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
+			FIXED_TC_WIDTH, RAW_TC_ROWS,
+			FIXED_TC_WIDTH, UTI260B_CAPTURE_ROWS,
+			RESET_STR());
+		return -1;
+	}
+
+	if ( RAW_TC_ROWS == captureFrame.rows ) {
+		rawFrame = captureFrame;
+		return 0;
+	}
+
+	if ( UTI260B_CAPTURE_ROWS == captureFrame.rows ) {
+		Mat visibleRows = captureFrame( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
+		visibleRows.copyTo(rawFrame);
+		return 0;
+	}
+
+	printf("%sUnsupported frame height %d. Expected %d for TC001/P2 or %d for UTi260B 0BDA:3901.\n%s",
+		RED_STR(), captureFrame.rows, RAW_TC_ROWS, UTI260B_CAPTURE_ROWS, RESET_STR());
+	return -1;
+}
+
 int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
 #if 1
@@ -4891,12 +4964,17 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 #endif
 
 	printf( BLUE_STR() );
-	printf("%s(%d): Opening cameara %s\n", __func__,__LINE__, camera); FF();
+	printf("%s(%d): Opening cameara %s profile(%s) capture(%dx%d) temp_scale(%.1f)\n",
+		__func__,__LINE__, camera, cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale); FF();
 	printf( RESET_STR() );
  
 	// V4L - Video for Linux
 	// RGB needed for thermal data
 	// Convert to COLOR_YUV2BGR_YUYV for playback
+	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','V'));
+	cap.set(CAP_PROP_FRAME_WIDTH,  FIXED_TC_WIDTH);
+	cap.set(CAP_PROP_FRAME_HEIGHT, cameraCaptureRows);
+	cap.set(CAP_PROP_FPS, offline_fps);
 	cap.set(CAP_PROP_CONVERT_RGB, 0.0); 
 	cap.set(CAP_PROP_MONOCHROME,  1.0); 
 	// TODO-FIXME - Investigate CAP_PROP_FORMAT and -1 for raw
@@ -4971,6 +5049,7 @@ double waitMicros = -1; // Keep thread wait times
 
 int parseArgs( int argc, char *argv[], char *camera, VideoCapture &cap, ProcessedThermalFrame *ptf ) {
 	int inputNotFound = -1;
+	int openCameraAfterParse = 0;
 	int next;
 	int hasNext;
 	for ( int i = 1; i < argc; i++ ) {
@@ -5012,6 +5091,13 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 		} else if ( ! strcmp( argv[i], "-fps") && hasNext ) {
 			offline_fps = abs( atoi( argv[ i + 1 ] ) );
 			i++;
+		} else if ( ! strcmp( argv[i], "-profile") && hasNext ) {
+			if ( setCameraProfile( argv[ i + 1 ] ) < 0 ) {
+				return -1;
+			}
+			i++;
+		} else if ( ! strcmp( argv[i], "-uti260b") ) {
+			setUTi260BProfile();
 		} else if ( ! strcmp( argv[i], "-clip") && hasNext ) {
 			rulerBoundFlag = abs( atoi( argv[ i + 1 ] ) ) % BOUND_MAX_MOD;
 			i++;
@@ -5044,6 +5130,7 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			}
 			filterType  = FILTER_TYPE_NONE; // Show Nuked Kelvin data in WINDOW_DOUBLE
 			inputNotFound = 0;
+			openCameraAfterParse = 0;
 			i++;
 		} else if (( ! strcmp( argv[i], "-d"      ) ||
 			     ! strcmp( argv[i], "-device" ) ) && hasNext ) {
@@ -5053,16 +5140,21 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			if ( ! quietStdout ) {
 //				printf("%s(%d): Opening camera %s\n", __func__,__LINE__, camera ); FF();
 			}
-			if ( openCamera( cap, camera, 1 ) < 0 ) {
-				return -1;
-			}
 			inputNotFound = 0;
+			openCameraAfterParse = 1;
 			i++;
 		} else {
 			printf("%sUnknown argv[%d] (%s) or missing value\n%s", RED_STR(), i, argv[i], RESET_STR() );
 			return -1;
 		}
 	}
+
+	if ( openCameraAfterParse ) {
+		if ( openCamera( cap, camera, 1 ) < 0 ) {
+			return -1;
+		}
+	}
+
 	return inputNotFound;
 }
 
@@ -5130,9 +5222,9 @@ int mainPrivate (int argc, char *argv[]) {
 
 	// Mat frame;
 	// cv::Mat::Mat(int rows, int cols, int type)
-	Mat rawFrame(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used for FreezeFrame and to write .raw files
-	Mat tFrame_0(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used to facilitate camera connection recovery
-	Mat tFrame_1(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used to facilitate camera connection recovery
+	Mat rawFrame(RAW_TC_ROWS, FIXED_TC_WIDTH, CV_8UC2);              // Normalized frame used for FreezeFrame and .raw files
+	Mat tFrame_0(UTI260B_CAPTURE_ROWS, FIXED_TC_WIDTH, CV_8UC2);     // Capture buffer used to facilitate camera connection recovery
+	Mat tFrame_1(UTI260B_CAPTURE_ROWS, FIXED_TC_WIDTH, CV_8UC2);     // Capture buffer used to facilitate camera connection recovery
 	Mat rgbFrameOrig; // Scaled, rotated (not composited) RGB frame - COLOR_YUV2BR_YUYV
 	Mat rgbFrame;     // Scaled, rotated  and composited  RGB frame - COLOR_YUV2BR_YUYV
 
@@ -5354,14 +5446,12 @@ int mainPrivate (int argc, char *argv[]) {
 					int readError;
 					if (0 == lastGoodFrame) {
 						cap >> tFrame_1;
-						readError     = tFrame_1.empty();
-						lastGoodFrame = readError ?        0 :        1;
-						rawFrame      = readError ? tFrame_0 : tFrame_1;
+						readError     = normalizeRawFrame(tFrame_1, rawFrame);
+						lastGoodFrame = readError ? 0 : 1;
 					} else {
 						cap >> tFrame_0;
-						readError     = tFrame_0.empty();
-						lastGoodFrame = readError ?        1 :        0;
-						rawFrame      = readError ? tFrame_1 : tFrame_0;
+						readError     = normalizeRawFrame(tFrame_0, rawFrame);
+						lastGoodFrame = readError ? 1 : 0;
 					}
 
 					if ( readError ) {
@@ -5427,9 +5517,9 @@ int mainPrivate (int argc, char *argv[]) {
 		ASSERT((                     2 == rawFrame.channels() ))
 		ASSERT((                     2 == rawFrame.elemSize() ))
 		ASSERT((                     1 == rawFrame.elemSize1() ))
-		ASSERT(((size_t)(FIXED_TC_WIDTH*FIXED_TC_HEIGHT*2) == rawFrame.total() ))
+		ASSERT(((size_t)(FIXED_TC_WIDTH*RAW_TC_ROWS) == rawFrame.total() ))
 		ASSERT((  FIXED_TC_WIDTH       == rawFrame.cols ))
-		ASSERT(( (FIXED_TC_HEIGHT * 2) == rawFrame.rows ))   // 2 frames
+		ASSERT(( RAW_TC_ROWS           == rawFrame.rows ))   // 2 frames
 		ASSERT((  CV_8UC2              == rawFrame.type() )) // 2 channels of uint8
 		ASSERT((                     0 == rawFrame.depth() ))
 
