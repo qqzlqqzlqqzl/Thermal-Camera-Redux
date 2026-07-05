@@ -1757,6 +1757,10 @@ void setScaleControls() {
 #else
 	ColorScaleWidth = 3 + MyScale;  // 4 to N
 #endif
+	// YUY2/YUYV conversion requires an even pixel width.
+	if ( ColorScaleWidth & 1 ) {
+		ColorScaleWidth++;
+	}
 
 	// Help needs to be redrawn based on font change
 	controls.lastHelpScale = -1; // trigger Help to be redrawn
