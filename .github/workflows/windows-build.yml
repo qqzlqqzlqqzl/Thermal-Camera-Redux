@@ -93,7 +93,7 @@ jobs:
           OPENCV_LIB_SUFFIX="$(printf '%s' "$OPENCV_VERSION" | awk -F. '{ printf "%d%d%d", $1, $2, $3 }')"
           OPENCV_CFLAGS="-I$OPENCV_PREFIX/include"
           OPENCV_LIBS="-L$OPENCV_LIB_DIR -lopencv_highgui${OPENCV_LIB_SUFFIX} -lopencv_videoio${OPENCV_LIB_SUFFIX} -lopencv_imgcodecs${OPENCV_LIB_SUFFIX} -lopencv_imgproc${OPENCV_LIB_SUFFIX} -lopencv_core${OPENCV_LIB_SUFFIX}"
-          WINDOWS_LIBS="-lmfreadwrite -lmfplat -lmfuuid -lole32 -loleaut32"
+          WINDOWS_LIBS="-lmf -lmfreadwrite -lmfplat -lmfuuid -lole32 -loleaut32"
           g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 tc001.cpp thread.cpp -o redux.exe -lpthread ${OPENCV_CFLAGS} ${OPENCV_LIBS} ${WINDOWS_LIBS}
           ldd redux.exe | tee ../redux-ldd.txt
           ! grep "not found" ../redux-ldd.txt | grep -vi "api-ms-win-crt-"

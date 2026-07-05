@@ -455,6 +455,17 @@ bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
 		}
 	}
 
+	if ( preferUTi260B && selected < 0 ) {
+		printf("%sMedia Foundation could not find USB\\VID_0BDA&PID_3901 among %u video devices\n%s",
+			RED_STR(), deviceCount, RESET_STR());
+		for (UINT32 i = 0; i < deviceCount; i++) {
+			devices[i]->Release();
+		}
+		CoTaskMemFree(devices);
+		release();
+		return false;
+	}
+
 	if ( selected < 0 && 0 <= requestedIndex && requestedIndex < (int)deviceCount ) {
 		selected = requestedIndex;
 	}
@@ -503,7 +514,7 @@ bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
 			break;
 		}
 
-		GUID subtype = GUID_NULL;
+		GUID subtype = {};
 		UINT32 typeWidth = 0;
 		UINT32 typeHeight = 0;
 		nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
@@ -573,6 +584,14 @@ bool WindowsRawVideoCapture::read(Mat &dst) {
 			return false;
 		}
 		if ( flags & MF_SOURCE_READERF_ENDOFSTREAM ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( flags & MF_SOURCE_READERF_ERROR ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( flags & (MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED | MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) ) {
 			safeRelease(&sample);
 			return false;
 		}
