@@ -24,6 +24,9 @@ used by `USB\VID_0BDA&PID_3901`.
   plane.
 - Window layout switching remains on the thermal view for this profile, because
   image/double layouts would otherwise expose the ignored noisy image plane.
+- The UTi260B profile defaults to a 90 degree clockwise display rotation. Use
+  `-rotate 0`, `-rotate 180`, or `-rotate 270` after the launcher command if the
+  physical mount needs a different orientation.
 
 ## Run
 
@@ -43,6 +46,18 @@ The launcher expands to:
 ```bat
 Thermal-Camera-Redux.exe -uti260b -d <device-index>
 ```
+
+Extra arguments are passed through, for example:
+
+```bat
+run_uti260b_windows.cmd 0 -rotate 0
+run_uti260b_windows.cmd 0 -temp-offset-c -3.5
+run_uti260b_windows.cmd 0 -temp-offset-f -6.3
+```
+
+`-temp-offset-c` and `-temp-offset-f` adjust displayed temperatures only. They
+do not rewrite `.raw` snapshots or change the thermal matrix used for color
+auto-ranging.
 
 The tested Windows device list was:
 
@@ -70,7 +85,7 @@ Expected raw UVC format:
 - rows `0..191`: auxiliary/noisy image plane, ignored for UTi260B rendering
 - rows `192..383`: `256x192` little-endian thermal matrix
 - rows `384..385`: trailer metadata ignored by this branch
-- temperature conversion: `raw / 16 - 273.15`
+- temperature conversion: `raw / 16 - 273.15 + offset_c`
 
 The camera may output invalid high temperatures during the first few seconds
 after startup. Let it warm up before judging readings.

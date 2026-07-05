@@ -311,6 +311,7 @@ static const char *cameraProfileName = "tc001";
 static int cameraCaptureRows = RAW_TC_ROWS;
 static int cameraHasImageFrame = 1;
 static float kelvinScale = 64.0;
+static float temperatureOffsetCelsius = 0.0;
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -842,6 +843,7 @@ static int leftDragOff = 1; // Track left mouse buttion drag
 
 // 0 = 0, 1 = 90, 2 = 180, 3 = 270 degrees
 static int RotateDisplay = DECODE_ROTATION ( ROTATION );
+static int ResetRotateDisplay = DECODE_ROTATION ( ROTATION );
 
 static const char * ROTATION_STR =	(  0 <= ROTATION && ROTATION <  90) ?   "0" :
 					( 90 <= ROTATION && ROTATION < 180) ?  "90" :
@@ -1238,7 +1240,7 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 #else
 
 float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	return ( ((float)kelvin / kelvinScale) - 273.15 );
+	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius );
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
@@ -2074,7 +2076,7 @@ static int HelpHeight      = TC_HEIGHT;
 #define MAX_HELP_TEXT_ROWS (20 + 1)  // Was (24 + 1)
 #define MAX_HUD_TEXT_ROWS  ( 9 + 1)
 
-const char * LONGEST_HUD_STRING  = "Map: Twighlight Shift+Hist";
+const char * LONGEST_HUD_STRING  = "FPS: 123.4  Therm Off:-123.4 C";
 const char * LONGEST_HELP_STRING = "L mb: Add temps, mv rulers ";
 
 #define MAX_SCALE_FOR_FONT 5.0
@@ -3499,6 +3501,7 @@ void printUsage() {
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
   printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
+  printf( "                 [-temp-offset-c n] [-temp-offset-f n]\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -3556,8 +3559,8 @@ void printInfo() {
 	  DISPLAY_WIDTH, DISPLAY_HEIGHT, MAX_SCALE_STEPS, TC_DEF_SCALE, ROTATION_STR,
 	  USE_CELSIUS?"Celsius":"Fahrenheit", MAX_CMAPS, cmaps[controls.cmapCurrent]->name
        	);
-  printf("    camera profile %s, capture %dx%d, temperature scale %.1f\n",
-	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale);
+  printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C\n",
+	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius);
   printf("    %s-threaded with %s scrolling\n",
 
 #if DRAW_SINGLE_THREAD
@@ -3716,17 +3719,20 @@ FILTER_TYPE_CHANGE:
 			  threadData.configurationChanged++;
 			  resetDefaults(); 
 			  if ( ! cameraHasImageFrame ) {
+				  RotateDisplay = ResetRotateDisplay;
+				  setHeightWidth();
 				  controls.windowFormat = WINDOW_THERMAL;
 				  setWindowFormat();
 				  setHudLock();
+				  resizeWindow(ptf);
 			  }
 			  if ( rulersOn ) {
 			  	// Reset rulers to center of screen
-				rulers(ptf, FIXED_TC_WIDTH/2, FIXED_TC_HEIGHT/2, 0); 
+				rulers(ptf, TC_HALF_WIDTH, TC_HALF_HEIGHT, 0);
 			  } else {
 			  	// Reset ruler anchors to center of screen
-			 	rulersX = FIXED_TC_WIDTH/2; 
-				rulersY = FIXED_TC_HEIGHT/2;
+				rulersX = TC_HALF_WIDTH;
+				rulersY = TC_HALF_HEIGHT;
 			  }
 			  break;    // Reset Defaults
 
@@ -4174,7 +4180,11 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, L_X, Y(7) ); 
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, *ptf->rColor, 1, hudLineType);
 
-	sprintf(buf, "FPS: %.1f  %s", controls.fps, controls.labelWF);
+	if ( 0.0 != temperatureOffsetCelsius ) {
+		sprintf(buf, "FPS: %.1f  %s Off:%+.1f C", controls.fps, controls.labelWF, temperatureOffsetCelsius);
+	} else {
+		sprintf(buf, "FPS: %.1f  %s", controls.fps, controls.labelWF);
+	}
 	POINT( hudPoint, L_X, Y(8) ); 
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 }
@@ -5321,6 +5331,9 @@ void setUTi260BProfile() {
 	cameraCaptureRows = UTI260B_CAPTURE_ROWS;
 	cameraHasImageFrame = 0;
 	kelvinScale = 16.0;
+	RotateDisplay = 1;
+	ResetRotateDisplay = RotateDisplay;
+	setHeightWidth();
 	controls.windowFormat = WINDOW_THERMAL;
 	setWindowFormat();
 	setHudLock();
@@ -5454,8 +5467,9 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 #endif
 
 	printf( BLUE_STR() );
-	printf("%s(%d): Opening cameara %s profile(%s) capture(%dx%d) temp_scale(%.1f)\n",
-		__func__,__LINE__, camera, cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale); FF();
+	printf("%s(%d): Opening cameara %s profile(%s) capture(%dx%d) temp_scale(%.1f) temp_offset(%+.1f C) rotate(%d)\n",
+		__func__,__LINE__, camera, cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale,
+		temperatureOffsetCelsius, RotateDisplay * 90); FF();
 	printf( RESET_STR() );
  
 	// V4L - Video for Linux
@@ -5592,6 +5606,16 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			i++;
 		} else if ( ! strcmp( argv[i], "-uti260b") ) {
 			setUTi260BProfile();
+		} else if (( ! strcmp( argv[i], "-temp-offset-c") ||
+			     ! strcmp( argv[i], "-offset-c"     )) && hasNext ) {
+			temperatureOffsetCelsius = atof( argv[ i + 1 ] );
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-temp-offset-f") ||
+			     ! strcmp( argv[i], "-offset-f"     )) && hasNext ) {
+			temperatureOffsetCelsius = atof( argv[ i + 1 ] ) * 5.0 / 9.0;
+			threadData.configurationChanged++;
+			i++;
 		} else if ( ! strcmp( argv[i], "-clip") && hasNext ) {
 			rulerBoundFlag = abs( atoi( argv[ i + 1 ] ) ) % BOUND_MAX_MOD;
 			i++;
@@ -5613,6 +5637,7 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			if ( 3 < RotateDisplay ) {
 				RotateDisplay = 0;
 			}
+			ResetRotateDisplay = RotateDisplay;
 			rotateDisplay( ptf, 0 );
 			i++;
 		} else if (( ! strcmp( argv[i], "-f"    ) ||
