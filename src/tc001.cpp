@@ -309,6 +309,7 @@ void dumpV4L2() {
 
 static const char *cameraProfileName = "tc001";
 static int cameraCaptureRows = RAW_TC_ROWS;
+static int cameraHasImageFrame = 1;
 static float kelvinScale = 64.0;
 
 #ifndef HUD_ALPHA
@@ -2720,9 +2721,10 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		long            ktotal        = 0; // Calculate average temps in thermal frame
 		// ************* BEGIN LOOP UNROLL ***************************
 
-        	unsigned short *imgPtr = &((unsigned short *)(imageFrame.datastart))[0];
+		int scanImageRange = lockAutoRanging && cameraHasImageFrame;
+		unsigned short *imgPtr = scanImageRange ? &((unsigned short *)(imageFrame.datastart))[0] : 0;
 
-		for ( ; (usKelvinPtr < usMaxPtr); usKelvinPtr += 8 , imgPtr += 8 ) {
+		for ( ; (usKelvinPtr < usMaxPtr); usKelvinPtr += 8 ) {
 			// Linear Parsing
 			// long kelvin = usKelvinPtr[0] + (usKelvinPtr[1] << 8); // LSByte + MSByte
 
@@ -2763,7 +2765,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 			UNROLL_MAX(kmax, lmax, 6)
 			UNROLL_MAX(kmax, lmax, 7)
 
-			if ( lockAutoRanging ) {
+			if ( scanImageRange ) {
 
 #define UNROLL_IMG_MIN(g,n)	if ( g > *(imgPtr + n) ) { \
 					g = *(imgPtr + n); \
@@ -2792,6 +2794,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 				UNROLL_IMG_MAX(frameImgMax, 6)
 				UNROLL_IMG_MAX(frameImgMax, 7)
 
+				imgPtr += 8;
 			}
 		}
 		// ************* END LOOP UNROLL ***************************
@@ -2800,6 +2803,11 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		ptf->max.kelvin  = kmax;
 		ptf->min.linearI = lmin;
 		ptf->max.linearI = lmax;
+
+		if ( ! cameraHasImageFrame && lockAutoRanging ) {
+			frameImgMin = BASE_PIXEL;
+			frameImgMax = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+		}
 
 		// Grab once for CLIP or GROW
 		if ( growOrClip ) {
@@ -2915,16 +2923,21 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		minImagePixel = globalImgMin;
 		maxImagePixel = globalImgMax;
 	} else {
-		// STILL NEEDED TO GET AUTO_RANGING SUB_MAP RANGE
-  		unsigned short *usImgPtr = &((unsigned short *)(imageFrame.datastart))[0];
-		minImagePixel = usImgPtr[ ptf->min.linearI ];
-		maxImagePixel = usImgPtr[ ptf->max.linearI ];
+		if ( ! cameraHasImageFrame ) {
+			minImagePixel = BASE_PIXEL;
+			maxImagePixel = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+		} else {
+			// STILL NEEDED TO GET AUTO_RANGING SUB_MAP RANGE
+			unsigned short *usImgPtr = &((unsigned short *)(imageFrame.datastart))[0];
+			minImagePixel = usImgPtr[ ptf->min.linearI ];
+			maxImagePixel = usImgPtr[ ptf->max.linearI ];
+		}
 	}
 
 	// Track either crosshair temp or ruler crosshair temp on the colormap scale
 	float chCelsius   = (rulersOn ? user_CENTER_OF_RULER_INDEX->celsius : ptf->ch.celsius);
 	float chRange     = (chCelsius - minPixelCelsius);
-	float chFraction  = (chRange / minMaxRange);
+	float chFraction  = ( 0.0 == minMaxRange ) ? 0.5 : (chRange / minMaxRange);
 
 	float minMaxRangeKelvin   = (ptf->max.kelvin - ptf->min.kelvin);
 	if ( lockAutoRanging ) {
@@ -2959,7 +2972,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		// Colormap thermal gradiant scale temps
 		float avgCelsius  = ptf->avg.celsius;
 		float avgRange    = (avgCelsius - minPixelCelsius);
-		float avgFraction = (avgRange / minMaxRange);
+		float avgFraction = ( 0.0 == minMaxRange ) ? 0.5 : (avgRange / minMaxRange);
 
 		ptf->avgLevelPixel.kelvin  = (kminPixel + kmaxPixel) * avgFraction;
 		ptf->avgLevelPixel.linearI = (lminPixel + lmaxPixel) * avgFraction;
@@ -3188,6 +3201,14 @@ void windowFormat( ProcessedThermalFrame *ptf, int value ) {
 	if ( controls.recording ) { recording(ptf, 1); } // Stop active recording
 
 	threadData.configurationChanged++;
+
+	if ( ! cameraHasImageFrame ) {
+		controls.windowFormat = WINDOW_THERMAL;
+		setWindowFormat();
+		resizeWindow( ptf );
+		setHudLock();
+		return;
+	}
 
 	controls.windowFormat += value;
 
@@ -3694,6 +3715,11 @@ FILTER_TYPE_CHANGE:
 		case '5': 
 			  threadData.configurationChanged++;
 			  resetDefaults(); 
+			  if ( ! cameraHasImageFrame ) {
+				  controls.windowFormat = WINDOW_THERMAL;
+				  setWindowFormat();
+				  setHudLock();
+			  }
 			  if ( rulersOn ) {
 			  	// Reset rulers to center of screen
 				rulers(ptf, FIXED_TC_WIDTH/2, FIXED_TC_HEIGHT/2, 0); 
@@ -4990,6 +5016,9 @@ unsigned short thermalRangeFilter_Generic( unsigned int thermalPixel ) {
 	if ( FILTER_TYPE_NONE == filterType ) {
 		return thermalPixel;
 	}
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		return BASE_PIXEL;
+	}
 
 	// Do range clipping
 	if	  ( thermalPixel <= globalKelvinMin ) {	// Low Clip
@@ -5043,6 +5072,9 @@ unsigned short thermalRangeFilter_Generic( unsigned int thermalPixel ) {
 
 
 unsigned short thermalRangeFilter_Linear( unsigned int thermalPixel ) {
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		return BASE_PIXEL;
+	}
 
 	// Do range clipping
 	if	  ( thermalPixel <= globalKelvinMin ) {	// Low Clip
@@ -5063,7 +5095,15 @@ unsigned short thermalRangeFilter_Linear( unsigned int thermalPixel ) {
 
 // This method will auto-range because it works straight from frameKelvinMid * frameKelvinRange
 unsigned short thermal2Image( unsigned int thermalPixel ) {
+	if ( 0 == frameKelvinRange ) {
+		return BASE_PIXEL;
+	}
 	float zero2One = (((float)thermalPixel - (float)frameKelvinMin) / (float)frameKelvinRange);
+	if ( zero2One < 0.0 ) {
+		zero2One = 0.0;
+	} else if ( 1.0 < zero2One ) {
+		zero2One = 1.0;
+	}
 	thermalPixel   = (( MAX_CLUT_PIX * zero2One ) + BASE_PIXEL);
 	return ( thermalPixel & 0x000080FF );
 }
@@ -5111,7 +5151,10 @@ void lockAutoRangeFilter( Mat &src, Mat &dst ) {
 	/*****************************************************************************
 		Emulate Disabling auto ranging:
 	*****************************************************************************/
-	ASSERT(( 0.0 != globalKelvinRange ))
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		thermalToImagePixel( src, dst );
+		return;
+	}
 
 	int max = src.rows * src.cols;
 
@@ -5269,13 +5312,19 @@ void *thermalDataThread( void *ptr ) {
 void setTC001Profile() {
 	cameraProfileName = "tc001";
 	cameraCaptureRows = RAW_TC_ROWS;
+	cameraHasImageFrame = 1;
 	kelvinScale = 64.0;
 }
 
 void setUTi260BProfile() {
 	cameraProfileName = "uti260b-0bda3901";
 	cameraCaptureRows = UTI260B_CAPTURE_ROWS;
+	cameraHasImageFrame = 0;
 	kelvinScale = 16.0;
+	controls.windowFormat = WINDOW_THERMAL;
+	setWindowFormat();
+	setHudLock();
+	threadData.configurationChanged++;
 }
 
 int setCameraProfile(const char *profile) {

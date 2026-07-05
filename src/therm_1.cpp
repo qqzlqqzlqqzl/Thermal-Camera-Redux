@@ -6,7 +6,7 @@
 		// Locking auto ranging puts early termal data mining requirements on 
 		// the image processing, thus processThermalFrame() gets called 
 		// earlier in IMAGE_0_CPP when lockAutoRanging is enabled
-		if ( ! lockAutoRanging ) {
+		if ( ! lockAutoRanging && cameraHasImageFrame ) {
 			processThermalFrame( ptf, &thermalFrame );
 		}
 
@@ -79,19 +79,19 @@
 
                         // Eliminate @ 450 kelvin2Celsius() calls / frame from getRuler[X|Y]Points()
                         // Eliminate @ 450 CorF()           calls / frame from getRuler[X|Y]Points()
-                        if ( Use_Celsius ) {
-                                // Interpret threshold as Celsius
-                                float cRange = ( ptf->max.celsius - ptf->min.celsius );
-                                float kDelta = ( ( thresholdF * kRange ) / cRange );
+			if ( Use_Celsius ) {
+				// Interpret threshold as Celsius
+				float cRange = ( ptf->max.celsius - ptf->min.celsius );
+				float kDelta = ( 0.0 == cRange ) ? 0.0 : ( ( thresholdF * kRange ) / cRange );
 
-                                minusThresholdKelvin = ( ptf->avg.kelvin - kDelta );
-                                plusThresholdKelvin  = ( ptf->avg.kelvin + kDelta );
+				minusThresholdKelvin = ( ptf->avg.kelvin - kDelta );
+				plusThresholdKelvin  = ( ptf->avg.kelvin + kDelta );
                         } else {
                                 // Interpret threshold as Fahrenheit
-                                // Range has to be calculated in like destination units (Apples - Apples)
-                                float fRange = celsius2Fahr( ptf->max.celsius ) -
-                                               celsius2Fahr( ptf->min.celsius );
-                                float kDelta = ( ( thresholdF * kRange ) / fRange );
+				// Range has to be calculated in like destination units (Apples - Apples)
+				float fRange = celsius2Fahr( ptf->max.celsius ) -
+					       celsius2Fahr( ptf->min.celsius );
+				float kDelta = ( 0.0 == fRange ) ? 0.0 : ( ( thresholdF * kRange ) / fRange );
 
                                 minusThresholdKelvin = ( ptf->avg.kelvin - kDelta );
                                 plusThresholdKelvin  = ( ptf->avg.kelvin + kDelta );
@@ -99,11 +99,16 @@
 
                         int anchorY, anchorX;
 
-                        if ( Max_Ruler_Thickness ) {
-                                float minMaxRange = rulerBoundMaxKelvin + rulerBoundMinKelvin;
-                                anchorY = ( TC_HEIGHT - 1 ) * rulerBoundMaxKelvin / minMaxRange;
-                                anchorX = ( TC_WIDTH  - 1 ) * rulerBoundMinKelvin / minMaxRange;
-                        } else {
+			if ( Max_Ruler_Thickness ) {
+				float minMaxRange = rulerBoundMaxKelvin + rulerBoundMinKelvin;
+				if ( 0.0 == minMaxRange ) {
+					anchorY = TC_HALF_HEIGHT;
+					anchorX = TC_HALF_WIDTH;
+				} else {
+					anchorY = ( TC_HEIGHT - 1 ) * rulerBoundMaxKelvin / minMaxRange;
+					anchorX = ( TC_WIDTH  - 1 ) * rulerBoundMinKelvin / minMaxRange;
+				}
+			} else {
                                 anchorX = rulersX;
                                 anchorY = rulersY;
                         }

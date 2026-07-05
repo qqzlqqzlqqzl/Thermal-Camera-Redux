@@ -19,6 +19,11 @@ used by `USB\VID_0BDA&PID_3901`.
 - UTi260B capture on Windows uses the app's Media Foundation raw YUY2 path,
   because OpenCV/DirectShow can expose this device as converted RGB and corrupt
   the thermal matrix.
+- This profile renders from the `256x192` thermal matrix directly. The first
+  half of this camera's UVC frame is not treated as a usable visible-light image
+  plane.
+- Window layout switching remains on the thermal view for this profile, because
+  image/double layouts would otherwise expose the ignored noisy image plane.
 
 ## Run
 
@@ -62,7 +67,7 @@ Thermal-Camera-Redux.exe -profile uti260b -d <device-index>
 Expected raw UVC format:
 
 - `256x386` YUY2/YUYV
-- rows `0..191`: visible image
+- rows `0..191`: auxiliary/noisy image plane, ignored for UTi260B rendering
 - rows `192..383`: `256x192` little-endian thermal matrix
 - rows `384..385`: trailer metadata ignored by this branch
 - temperature conversion: `raw / 16 - 273.15`
