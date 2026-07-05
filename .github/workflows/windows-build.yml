@@ -90,26 +90,18 @@ jobs:
           $status = $LASTEXITCODE
           Write-Host "Thermal-Camera-Redux.exe -help exited $status"
           if ($status -ne 255 -and $status -ne -1) {
-            $signature = @(
-              'using System;'
-              'using System.Runtime.InteropServices;'
-              'public static class Win32Load {'
-              '    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]'
-              '    public static extern IntPtr LoadLibraryW(string fileName);'
-              '    [DllImport("kernel32.dll")]'
-              '    public static extern bool FreeLibrary(IntPtr module);'
-              '}'
-            ) -join [Environment]::NewLine
-            Add-Type -TypeDefinition $signature
-            Get-ChildItem -Filter *.dll | Sort-Object Name | ForEach-Object {
-              $handle = [Win32Load]::LoadLibraryW($_.FullName)
-              if ($handle -eq [IntPtr]::Zero) {
-                $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Host "LOADLIB_FAILED $($_.Name) error=$err"
-              } else {
-                [void][Win32Load]::FreeLibrary($handle)
-              }
+            $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
+            if (Test-Path $toolchainBin) {
+              $env:Path = "$runtimeDir;$toolchainBin;C:\Windows\System32;C:\Windows\System;C:\Windows"
+              & .\Thermal-Camera-Redux.exe -help
+              Write-Host "Thermal-Camera-Redux.exe -help with toolchain PATH exited $LASTEXITCODE"
+              $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
             }
+            $depsDir = Join-Path $env:RUNNER_TEMP 'dependencies-cli'
+            $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
+            Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
+            Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
+            & (Join-Path $depsDir 'Dependencies.exe') -chain .\Thermal-Camera-Redux.exe
             Get-ChildItem -Recurse | Sort-Object FullName | Format-Table FullName, Length
             exit $status
           }
