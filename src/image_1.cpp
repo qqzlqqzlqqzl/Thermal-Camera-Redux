@@ -63,6 +63,14 @@
 				useFrameOrig = 1;
                         }
 
+			if ( displayEnhancementsEnabled() ) {
+				if ( ! useFrameOrig ) {
+					*threadData.rgbFrameOrig = sourcePtr->clone();
+					useFrameOrig = 1;
+				}
+				applyDisplayEnhancements( *threadData.rgbFrameOrig );
+			}
+
                         //  Colormaps do not support ALPHA/TRANSPARENTCIES
                         //  what():  OpenCV(4.5.1) ../modules/imgproc/src/colormap.cpp:736: error: (-5:Bad argument)
                         //  cv::ColorMap only supports source images of type CV_8UC1 or CV_8UC3 in function 'operator()'

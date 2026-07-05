@@ -9,8 +9,8 @@ used by `USB\VID_0BDA&PID_3901`.
 - The local Windows machine does not need MSYS2, OpenCV headers, or OpenCV
   development libraries to run the packaged build.
 - The uploaded artifact is intended to be the distributable runtime folder:
-  `Thermal-Camera-Redux.exe`, only the required runtime DLLs, and
-  `run_uti260b_windows.cmd`.
+  `Thermal-Camera-Redux.exe`, `Thermal-Camera-Redux-GUI.exe`, only the
+  required runtime DLLs, and `run_uti260b_windows.cmd`.
 - Do not redistribute the full OpenCV SDK, headers, import libraries, or MSYS2
   package cache with the runtime folder.
 - The Windows CI build compiles a minimal OpenCV with Win32 UI and DirectShow
@@ -33,6 +33,17 @@ used by `USB\VID_0BDA&PID_3901`.
 From the extracted artifact folder:
 
 ```bat
+Thermal-Camera-Redux-GUI.exe
+```
+
+This is the normal Windows entry point. The GUI saves settings in
+`thermal-camera-redux-gui.ini`, writes the exact command it launches to
+`thermal-camera-redux-last-command.txt`, and starts `Thermal-Camera-Redux.exe`
+from the same folder.
+
+The command-line launcher is still available:
+
+```bat
 run_uti260b_windows.cmd
 ```
 
@@ -53,11 +64,30 @@ Extra arguments are passed through, for example:
 run_uti260b_windows.cmd 0 -rotate 0
 run_uti260b_windows.cmd 0 -temp-offset-c -3.5
 run_uti260b_windows.cmd 0 -temp-offset-f -6.3
+run_uti260b_windows.cmd 0 -display-scale 4 -interp lanczos
+run_uti260b_windows.cmd 0 -filter-preset medium -bilateral low -temporal-denoise low -sharpen medium
 ```
 
 `-temp-offset-c` and `-temp-offset-f` adjust displayed temperatures only. They
 do not rewrite `.raw` snapshots or change the thermal matrix used for color
 auto-ranging.
+
+Display enhancement controls:
+
+- `Super-res scale`: display upscale factor. GUI exposes 1x to 4x for stable
+  realtime use; command-line `-display-scale`/`-scale` is clamped to the build's
+  maximum scale.
+- `Interpolation`: classic software super-resolution/display upscale method.
+  Supported GUI choices are Nearest, Bilinear, Bicubic, and Lanczos.
+- `Filter preset`: display-only Gaussian smoothing, Off/Low/Medium/Strong.
+- `Bilateral`: display-only edge-preserving smoothing, Off/Low/Medium/Strong.
+- `Temporal denoise`: display-only frame blending, Off/Low/Medium/Strong.
+- `Sharpen`: display-only unsharp-mask sharpening, Off/Low/Medium/Strong.
+
+These enhancement controls only affect the rendered display frame before the
+HUD/markers are drawn. Temperature readings, min/max/avg, center temperature,
+rulers, and `.raw` snapshots continue to use the original `256x192` thermal
+matrix.
 
 The tested Windows device list was:
 

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <string>
 #include <cwctype>
+#include <ctype.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -1190,6 +1191,20 @@ Inter Inters[] = {
 #endif
 };
 
+typedef struct {
+	const char *name;
+	const char *shortName;
+} DisplayLevel;
+
+DisplayLevel DisplayLevels[] = {
+	{ "Off",    "Off" },
+	{ "Low",    "Low" },
+	{ "Medium", "Med" },
+	{ "Strong", "High" }
+};
+
+#define MAX_DISPLAY_LEVELS ARRAY_COUNT( DisplayLevels )
+
 typedef enum {
 	ACTIVE_OFF = 0,
 	ACTIVE_ON,
@@ -1338,6 +1353,10 @@ typedef struct {
 	int cmapCurrent;
 	int rad;
 	int inters;
+	int displayFilterPreset;
+	int bilateralLevel;
+	int temporalDenoiseLevel;
+	int sharpenLevel;
 
 	int sW;			// scaled Width  of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
 	int sH;			// scaled Height of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
@@ -1379,6 +1398,118 @@ static Temperature *user_9  = &users[9];
 static Temperature *user_10 = &users[10];
 static Temperature *user_11 = &users[11];
 static Temperature *user_CENTER_OF_RULER_INDEX = &users[CENTER_OF_RULER_INDEX];
+
+static Mat displayTemporalFrame;
+
+static int clampDisplayLevel( int level ) {
+	if ( level < 0 ) {
+		return 0;
+	}
+	if ( level >= MAX_DISPLAY_LEVELS ) {
+		return MAX_DISPLAY_LEVELS - 1;
+	}
+	return level;
+}
+
+static const char *displayLevelName( int level ) {
+	return DisplayLevels[ clampDisplayLevel( level ) ].name;
+}
+
+static const char *displayLevelShortName( int level ) {
+	return DisplayLevels[ clampDisplayLevel( level ) ].shortName;
+}
+
+static bool displayEnhancementsEnabled() {
+	return controls.displayFilterPreset > 0 ||
+	       controls.bilateralLevel       > 0 ||
+	       controls.temporalDenoiseLevel > 0 ||
+	       controls.sharpenLevel         > 0;
+}
+
+static int oddKernelForLevel( int level ) {
+	switch ( clampDisplayLevel( level ) ) {
+		case 1: return 3;
+		case 2: return 5;
+		case 3: return 7;
+		default: return 0;
+	}
+}
+
+static void resetDisplayTemporalDenoise() {
+	displayTemporalFrame.release();
+}
+
+static void applyDisplayTemporalDenoise( Mat &frame ) {
+	int level = clampDisplayLevel( controls.temporalDenoiseLevel );
+	if ( 0 == level ) {
+		resetDisplayTemporalDenoise();
+		return;
+	}
+
+	if ( frame.empty() ) {
+		return;
+	}
+
+	if ( displayTemporalFrame.empty() ||
+	     displayTemporalFrame.rows != frame.rows ||
+	     displayTemporalFrame.cols != frame.cols ||
+	     displayTemporalFrame.type() != frame.type() ) {
+		frame.copyTo( displayTemporalFrame );
+		return;
+	}
+
+	double currentWeight =
+		(1 == level) ? 0.75 :
+		(2 == level) ? 0.60 : 0.45;
+	double previousWeight = 1.0 - currentWeight;
+
+	Mat blended;
+	addWeighted( frame, currentWeight, displayTemporalFrame, previousWeight, 0.0, blended );
+	blended.copyTo( displayTemporalFrame );
+	frame = blended;
+}
+
+static void applyDisplaySharpen( Mat &frame ) {
+	int level = clampDisplayLevel( controls.sharpenLevel );
+	if ( 0 == level || frame.empty() ) {
+		return;
+	}
+
+	double amount =
+		(1 == level) ? 0.35 :
+		(2 == level) ? 0.65 : 0.95;
+	double sigma =
+		(1 == level) ? 0.8 :
+		(2 == level) ? 1.0 : 1.2;
+
+	Mat blurred;
+	GaussianBlur( frame, blurred, Size(0, 0), sigma );
+	addWeighted( frame, 1.0 + amount, blurred, -amount, 0.0, frame );
+}
+
+static void applyDisplayEnhancements( Mat &frame ) {
+	if ( frame.empty() ) {
+		return;
+	}
+
+	int filterKernel = oddKernelForLevel( controls.displayFilterPreset );
+	if ( 0 < filterKernel ) {
+		GaussianBlur( frame, frame, Size(filterKernel, filterKernel), 0.0 );
+	}
+
+	int bilateralLevel = clampDisplayLevel( controls.bilateralLevel );
+	if ( 0 < bilateralLevel ) {
+		int diameter = (1 == bilateralLevel) ? 3 : (2 == bilateralLevel) ? 5 : 7;
+		double sigmaColor = (1 == bilateralLevel) ? 18.0 : (2 == bilateralLevel) ? 32.0 : 48.0;
+		double sigmaSpace = (1 == bilateralLevel) ? 3.0 : (2 == bilateralLevel) ? 5.0 : 7.0;
+		Mat filtered;
+		bilateralFilter( frame, filtered, diameter, sigmaColor, sigmaSpace );
+		frame = filtered;
+	}
+
+	applyDisplayTemporalDenoise( frame );
+	applyDisplaySharpen( frame );
+}
 
 // Optimization: Remove if's from rendering routines by using function pointer
 extern void drawTempMarker( Mat & frame, Temperature &temp, Scalar &dotColor );
@@ -2059,6 +2190,11 @@ void resetDefaults() {
 	controls.labelCF      = controls.useCelsius ? " C" : " F";
 	controls.alpha        = 1.0;
 	controls.rad          = 0; // Blur radius (0=no blur)
+	controls.displayFilterPreset = 0;
+	controls.bilateralLevel       = 0;
+	controls.temporalDenoiseLevel = 0;
+	controls.sharpenLevel         = 0;
+	resetDisplayTemporalDenoise();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
 	strcpy(controls.snaptime, "None");
@@ -2076,7 +2212,7 @@ static int HelpHeight      = TC_HEIGHT;
 #define MAX_HELP_TEXT_ROWS (20 + 1)  // Was (24 + 1)
 #define MAX_HUD_TEXT_ROWS  ( 9 + 1)
 
-const char * LONGEST_HUD_STRING  = "FPS: 123.4  Therm Off:-123.4 C";
+const char * LONGEST_HUD_STRING  = "Flt:Medium B:Medium T:Medium S:Strong";
 const char * LONGEST_HELP_STRING = "L mb: Add temps, mv rulers ";
 
 #define MAX_SCALE_FOR_FONT 5.0
@@ -3502,6 +3638,9 @@ void printUsage() {
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
   printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
   printf( "                 [-temp-offset-c n] [-temp-offset-f n]\n");
+  printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
+  printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
+  printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -3562,6 +3701,12 @@ void printInfo() {
   printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C, display rotation %d\n",
 	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius,
 	  RotateDisplay * 90);
+  printf("    display super-resolution %dx %s, filter %s, bilateral %s, temporal %s, sharpen %s\n",
+	  MyScale, Inters[controls.inters].name,
+	  displayLevelName(controls.displayFilterPreset),
+	  displayLevelName(controls.bilateralLevel),
+	  displayLevelName(controls.temporalDenoiseLevel),
+	  displayLevelName(controls.sharpenLevel));
   printf("    %s-threaded with %s scrolling\n",
 
 #if DRAW_SINGLE_THREAD
@@ -4153,7 +4298,7 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, L_X, Y(2) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
-	sprintf(buf, "Blur: %d  Intr: %s", controls.rad, Inters[controls.inters].name);
+	sprintf(buf, "SR:%dx %s Blur:%d", MyScale, Inters[controls.inters].name, controls.rad);
 	POINT( hudPoint, L_X, Y(3) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
@@ -4169,7 +4314,11 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, L_X+ts.width, Y(4) );
 	putText(rgbHUD, src, hudPoint, Default_Font, HudFontScale, srcColor, 1, hudLineType);
 
-	sprintf(buf, "Contrast: %.1f%s", controls.alpha, threadData.FreezeFrame ? " Freeze" : "" );
+	sprintf(buf, "Flt:%s B:%s T:%s S:%s",
+		displayLevelShortName(controls.displayFilterPreset),
+		displayLevelShortName(controls.bilateralLevel),
+		displayLevelShortName(controls.temporalDenoiseLevel),
+		displayLevelShortName(controls.sharpenLevel));
 	POINT( hudPoint, L_X, Y(5) ); 
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
@@ -5556,6 +5705,115 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 double perfMax    = -1; // Keep track of longest thread duration
 double waitMicros = -1; // Keep thread wait times
 
+static bool strEqualsIgnoreCase( const char *a, const char *b ) {
+	if ( ! a || ! b ) {
+		return false;
+	}
+
+	while ( *a && *b ) {
+		if ( tolower((unsigned char)*a) != tolower((unsigned char)*b) ) {
+			return false;
+		}
+		a++;
+		b++;
+	}
+	return (0 == *a && 0 == *b);
+}
+
+static bool isIntegerString( const char *value ) {
+	if ( ! value || ! *value ) {
+		return false;
+	}
+	if ( '-' == *value || '+' == *value ) {
+		value++;
+	}
+	if ( ! *value ) {
+		return false;
+	}
+	while ( *value ) {
+		if ( ! isdigit((unsigned char)*value) ) {
+			return false;
+		}
+		value++;
+	}
+	return true;
+}
+
+static int parseScaleValue( const char *value ) {
+	int scale = atoi( value );
+	if ( scale < 1 ) {
+		scale = 1;
+	}
+	if ( scale > MAX_SCALE_STEPS ) {
+		scale = MAX_SCALE_STEPS;
+	}
+	return scale;
+}
+
+static int parseDisplayLevel( const char *value ) {
+	if ( isIntegerString( value ) ) {
+		return clampDisplayLevel( atoi( value ) );
+	}
+
+	if ( strEqualsIgnoreCase( value, "off" ) ||
+	     strEqualsIgnoreCase( value, "none" ) ||
+	     strEqualsIgnoreCase( value, "0" ) ) {
+		return 0;
+	}
+	if ( strEqualsIgnoreCase( value, "low" ) ||
+	     strEqualsIgnoreCase( value, "light" ) ||
+	     strEqualsIgnoreCase( value, "1" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "medium" ) ||
+	     strEqualsIgnoreCase( value, "med" ) ||
+	     strEqualsIgnoreCase( value, "2" ) ) {
+		return 2;
+	}
+	if ( strEqualsIgnoreCase( value, "strong" ) ||
+	     strEqualsIgnoreCase( value, "high" ) ||
+	     strEqualsIgnoreCase( value, "3" ) ) {
+		return 3;
+	}
+	return -1;
+}
+
+static int parseInterpolationIndex( const char *value ) {
+	if ( isIntegerString( value ) ) {
+		int index = atoi( value );
+		if ( index < 0 || index >= MAX_INTERS ) {
+			return -1;
+		}
+		return index;
+	}
+
+	for ( int i = 0; i < MAX_INTERS; i++ ) {
+		if ( strEqualsIgnoreCase( value, Inters[i].name ) ) {
+			return i;
+		}
+	}
+
+	if ( strEqualsIgnoreCase( value, "bilinear" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "bicubic" ) ) {
+		return 2;
+	}
+	if ( strEqualsIgnoreCase( value, "lanczos" ) ) {
+		return 4;
+	}
+	if ( strEqualsIgnoreCase( value, "nearest" ) ) {
+		return 0;
+	}
+	if ( strEqualsIgnoreCase( value, "linear" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "cubic" ) ) {
+		return 2;
+	}
+	return -1;
+}
+
 int parseArgs( int argc, char *argv[], char *camera, VideoCapture &cap, ProcessedThermalFrame *ptf ) {
 	int inputNotFound = -1;
 	int openCameraAfterParse = 0;
@@ -5566,8 +5824,14 @@ int parseArgs( int argc, char *argv[], char *camera, VideoCapture &cap, Processe
 		next    = (i + 1);
 		hasNext = (next < argc);
 
-		if ( ! strcmp( argv[i], "-scale") && hasNext ) {
-			MyScale = abs( atoi( argv[ i + 1 ] ) ) % (MAX_SCALE_STEPS+1);
+		if (( ! strcmp( argv[i], "-scale") ||
+		      ! strcmp( argv[i], "-display-scale") ||
+		      ! strcmp( argv[i], "-superres") ||
+		      ! strcmp( argv[i], "-super-resolution")) && hasNext ) {
+			MyScale = parseScaleValue( argv[ i + 1 ] );
+			MyHalfScale = MyScale / 2;
+			setScaleControls();
+			threadData.configurationChanged++;
 			i++;
 		} else if ( ! strcmp( argv[i], "-fullscreen") ) {
 			controls.fullscreen = 1;
@@ -5596,6 +5860,62 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			}
 		} else if ( ! strcmp( argv[i], "-cmap") && hasNext ) {
 			controls.cmapCurrent = abs( atoi( argv[ i + 1 ] ) ) % MAX_CMAPS;
+			i++;
+		} else if (( ! strcmp( argv[i], "-interp") ||
+			     ! strcmp( argv[i], "-interpolation")) && hasNext ) {
+			int index = parseInterpolationIndex( argv[ i + 1 ] );
+			if ( index < 0 ) {
+				printf("%sUnknown interpolation '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.inters = index;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-blur") ||
+			     ! strcmp( argv[i], "-box-blur")) && hasNext ) {
+			controls.rad = abs( atoi( argv[ i + 1 ] ) );
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-filter-preset") ||
+			     ! strcmp( argv[i], "-display-filter")) && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown filter preset '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.displayFilterPreset = level;
+			threadData.configurationChanged++;
+			i++;
+		} else if ( ! strcmp( argv[i], "-bilateral") && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown bilateral level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.bilateralLevel = level;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-temporal-denoise") ||
+			     ! strcmp( argv[i], "-temporal")) && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown temporal denoise level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.temporalDenoiseLevel = level;
+			if ( 0 == level ) {
+				resetDisplayTemporalDenoise();
+			}
+			threadData.configurationChanged++;
+			i++;
+		} else if ( ! strcmp( argv[i], "-sharpen") && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown sharpen level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.sharpenLevel = level;
+			threadData.configurationChanged++;
 			i++;
 		} else if ( ! strcmp( argv[i], "-fps") && hasNext ) {
 			offline_fps = abs( atoi( argv[ i + 1 ] ) );

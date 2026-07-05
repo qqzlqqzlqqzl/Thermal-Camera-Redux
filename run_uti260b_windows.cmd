@@ -24,5 +24,6 @@ goto collect_args
 
 :run
 echo UTi260B mode: auto-selecting USB\VID_0BDA^&PID_3901 when present.
+echo GUI entry point: Thermal-Camera-Redux-GUI.exe
 echo Extra args are passed through, e.g. -rotate 0 or -temp-offset-c -3.5.
 "%DIR%Thermal-Camera-Redux.exe" -uti260b -d %DEVICE_INDEX% %EXTRA_ARGS%

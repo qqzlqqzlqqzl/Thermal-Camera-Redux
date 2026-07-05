@@ -95,6 +95,7 @@ jobs:
           OPENCV_LIBS="-L$OPENCV_LIB_DIR -lopencv_highgui${OPENCV_LIB_SUFFIX} -lopencv_videoio${OPENCV_LIB_SUFFIX} -lopencv_imgcodecs${OPENCV_LIB_SUFFIX} -lopencv_imgproc${OPENCV_LIB_SUFFIX} -lopencv_core${OPENCV_LIB_SUFFIX}"
           WINDOWS_LIBS="-lmf -lmfreadwrite -lmfplat -lmfuuid -lole32 -loleaut32"
           g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 tc001.cpp thread.cpp -o redux.exe -lpthread ${OPENCV_CFLAGS} ${OPENCV_LIBS} ${WINDOWS_LIBS}
+          g++ -std=c++17 -Wall -Wextra -O2 ${CFLAGS} launcher_win32.cpp -o Thermal-Camera-Redux-GUI.exe -mwindows -lcomctl32
           ldd redux.exe | tee ../redux-ldd.txt
           ! grep "not found" ../redux-ldd.txt | grep -vi "api-ms-win-crt-"
 
@@ -104,6 +105,7 @@ jobs:
           set -euxo pipefail
           mkdir -p ../dist/windows-x64
           cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
+          cp Thermal-Camera-Redux-GUI.exe ../dist/windows-x64/
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
           OPENCV_BIN="$PWD/../opencv-install/x64/mingw/bin"
           if [ ! -d "$OPENCV_BIN" ]; then
@@ -133,6 +135,7 @@ jobs:
             done
           }
           copy_mingw_deps redux.exe
+          copy_mingw_deps Thermal-Camera-Redux-GUI.exe
           find "$OPENCV_BIN" -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
           find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
             copy_mingw_deps "$plugin"
@@ -151,6 +154,14 @@ jobs:
           & .\Thermal-Camera-Redux.exe -help
           $status = $LASTEXITCODE
           Write-Host "Thermal-Camera-Redux.exe -help exited $status"
+          & .\Thermal-Camera-Redux-GUI.exe --dry-run
+          if ($LASTEXITCODE -ne 0) {
+            throw "Thermal-Camera-Redux-GUI.exe --dry-run failed with $LASTEXITCODE"
+          }
+          if (-not (Test-Path .\thermal-camera-redux-last-command.txt)) {
+            throw 'GUI dry-run did not write thermal-camera-redux-last-command.txt'
+          }
+          Get-Content .\thermal-camera-redux-last-command.txt
           if ($status -ne 255 -and $status -ne -1) {
             $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
             if (Test-Path $toolchainBin) {
