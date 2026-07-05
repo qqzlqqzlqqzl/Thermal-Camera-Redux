@@ -40,10 +40,34 @@ jobs:
           mkdir -p ../dist/windows-x64
           cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
-          ldd redux.exe | awk '/\/ucrt64\// { print $3 }' | sort -u | while read -r dll; do
-            cp -n "$dll" ../dist/windows-x64/
-          done
+          declare -A copied
+          copy_mingw_deps() {
+            local queue=("$1")
+            while [ "${#queue[@]}" -gt 0 ]; do
+              local target="${queue[0]}"
+              queue=("${queue[@]:1}")
+              while read -r dll_name; do
+                local key
+                key="$(printf '%s' "$dll_name" | tr '[:upper:]' '[:lower:]')"
+                if [ -n "${copied[$key]:-}" ]; then
+                  continue
+                fi
+                local dll_path
+                dll_path="$(find /ucrt64/bin -maxdepth 1 -iname "$dll_name" -print -quit)"
+                if [ -z "$dll_path" ]; then
+                  continue
+                fi
+                copied[$key]=1
+                cp -n "$dll_path" ../dist/windows-x64/
+                queue+=("$dll_path")
+              done < <(objdump -p "$target" | awk '/DLL Name:/ { print $3 }')
+            done
+          }
+          copy_mingw_deps redux.exe
           find /ucrt64/bin -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
+          find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
+            copy_mingw_deps "$plugin"
+          done
           for qt_plugins in /ucrt64/share/qt6/plugins /ucrt64/share/qt5/plugins; do
             if [ -f "$qt_plugins/platforms/qwindows.dll" ]; then
               mkdir -p ../dist/windows-x64/platforms
@@ -58,8 +82,13 @@ jobs:
         working-directory: dist/windows-x64
         run: |
           set -euxo pipefail
-          export PATH="$(pwd)"
-          ./Thermal-Camera-Redux.exe -help || test "$?" -eq 255
+          export PATH="$(pwd):/c/Windows/System32:/c/Windows/System:/c/Windows"
+          status=0
+          ./Thermal-Camera-Redux.exe -help || status="$?"
+          if [ "$status" -ne 255 ]; then
+            PATH="$(pwd):/usr/bin:/c/Windows/System32:/c/Windows/System:/c/Windows" ldd ./Thermal-Camera-Redux.exe || true
+            exit "$status"
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
