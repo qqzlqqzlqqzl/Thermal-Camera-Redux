@@ -107,6 +107,7 @@ jobs:
           cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
           cp Thermal-Camera-Redux-GUI.exe ../dist/windows-x64/
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
+          cp ../WINDOWS_UTI260B.md ../dist/windows-x64/
           OPENCV_BIN="$PWD/../opencv-install/x64/mingw/bin"
           if [ ! -d "$OPENCV_BIN" ]; then
             OPENCV_BIN="$PWD/../opencv-install/bin"

@@ -76,58 +76,79 @@ static std::vector<ComboItem> g_levelItems = {
 static std::vector<std::string> g_cmapLabels;
 static std::vector<std::string> g_cmapValues;
 
-static std::string exeDir() {
-	char path[MAX_PATH] = {0};
-	GetModuleFileNameA(NULL, path, MAX_PATH);
-	std::string value(path);
-	size_t slash = value.find_last_of("\\/");
-	if ( slash == std::string::npos ) {
-		return ".";
+static std::wstring widenAscii(const std::string &value) {
+	return std::wstring(value.begin(), value.end());
+}
+
+static std::string narrowAscii(const std::wstring &value) {
+	return std::string(value.begin(), value.end());
+}
+
+static std::string utf8FromWide(const std::wstring &value) {
+	if ( value.empty() ) {
+		return std::string();
+	}
+	int bytes = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, NULL, 0, NULL, NULL);
+	if ( bytes <= 0 ) {
+		return std::string();
+	}
+	std::string result((size_t)bytes - 1, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], bytes, NULL, NULL);
+	return result;
+}
+
+static std::wstring exeDirW() {
+	wchar_t path[MAX_PATH] = {0};
+	GetModuleFileNameW(NULL, path, MAX_PATH);
+	std::wstring value(path);
+	size_t slash = value.find_last_of(L"\\/");
+	if ( slash == std::wstring::npos ) {
+		return L".";
 	}
 	return value.substr(0, slash);
 }
 
-static std::string joinPath(const std::string &dir, const std::string &name) {
+static std::wstring joinPathW(const std::wstring &dir, const std::wstring &name) {
 	if ( dir.empty() ) {
 		return name;
 	}
-	char last = dir[dir.size() - 1];
-	if ( last == '\\' || last == '/' ) {
+	wchar_t last = dir[dir.size() - 1];
+	if ( last == L'\\' || last == L'/' ) {
 		return dir + name;
 	}
-	return dir + "\\" + name;
+	return dir + L"\\" + name;
 }
 
-static bool fileExists(const std::string &path) {
-	DWORD attrs = GetFileAttributesA(path.c_str());
+static bool fileExistsW(const std::wstring &path) {
+	DWORD attrs = GetFileAttributesW(path.c_str());
 	return attrs != INVALID_FILE_ATTRIBUTES && 0 == (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static std::string quoteArg(const std::string &arg) {
-	std::string out = "\"";
-	for ( char ch : arg ) {
-		if ( ch == '"' ) {
-			out += "\\\"";
+static std::wstring quoteArgW(const std::wstring &arg) {
+	std::wstring out = L"\"";
+	for ( wchar_t ch : arg ) {
+		if ( ch == L'"' ) {
+			out += L"\\\"";
 		} else {
 			out += ch;
 		}
 	}
-	out += "\"";
+	out += L"\"";
 	return out;
 }
 
-static std::string iniPath() {
-	return joinPath(exeDir(), "thermal-camera-redux-gui.ini");
+static std::wstring iniPathW() {
+	return joinPathW(exeDirW(), L"thermal-camera-redux-gui.ini");
 }
 
 static std::string readIni(const char *key, const char *fallback) {
-	char buffer[256] = {0};
-	GetPrivateProfileStringA("settings", key, fallback, buffer, sizeof(buffer), iniPath().c_str());
-	return std::string(buffer);
+	wchar_t buffer[256] = {0};
+	GetPrivateProfileStringW(L"settings", widenAscii(key).c_str(), widenAscii(fallback).c_str(), buffer, 256, iniPathW().c_str());
+	return narrowAscii(buffer);
 }
 
 static void writeIni(const char *key, const std::string &value) {
-	WritePrivateProfileStringA("settings", key, value.c_str(), iniPath().c_str());
+	WritePrivateProfileStringW(L"settings", widenAscii(key).c_str(), widenAscii(value).c_str(), iniPathW().c_str());
 }
 
 static void setFont(HWND hwnd) {
@@ -214,7 +235,7 @@ static void setText(HWND hwnd, const std::string &value) {
 	SetWindowTextA(hwnd, value.c_str());
 }
 
-static std::string buildCommandLineFromValues(
+static std::wstring buildCommandLineFromValues(
 	const std::string &deviceValue,
 	const std::string &rotationValue,
 	const std::string &scaleValue,
@@ -226,37 +247,37 @@ static std::string buildCommandLineFromValues(
 	const std::string &temporalValue,
 	const std::string &sharpenValue,
 	bool fullscreen) {
-	std::string dir = exeDir();
-	std::string exe = joinPath(dir, "Thermal-Camera-Redux.exe");
-	std::string device = deviceValue;
-	std::string offset = offsetValue;
+	std::wstring dir = exeDirW();
+	std::wstring exe = joinPathW(dir, L"Thermal-Camera-Redux.exe");
+	std::wstring device = widenAscii(deviceValue);
+	std::wstring offset = widenAscii(offsetValue);
 	if ( device.empty() ) {
-		device = "0";
+		device = L"0";
 	}
 	if ( offset.empty() ) {
-		offset = "0.0";
+		offset = L"0.0";
 	}
 
-	std::ostringstream cmd;
-	cmd << quoteArg(exe)
-	    << " -uti260b"
-	    << " -d " << quoteArg(device)
-	    << " -rotate " << quoteArg(rotationValue)
-	    << " -display-scale " << quoteArg(scaleValue)
-	    << " -interp " << quoteArg(interpValue)
-	    << " -cmap " << quoteArg(cmapValue)
-	    << " -temp-offset-c " << quoteArg(offset)
-	    << " -filter-preset " << quoteArg(filterValue)
-	    << " -bilateral " << quoteArg(bilateralValue)
-	    << " -temporal-denoise " << quoteArg(temporalValue)
-	    << " -sharpen " << quoteArg(sharpenValue);
+	std::wostringstream cmd;
+	cmd << quoteArgW(exe)
+	    << L" -uti260b"
+	    << L" -d " << quoteArgW(device)
+	    << L" -rotate " << quoteArgW(widenAscii(rotationValue))
+	    << L" -display-scale " << quoteArgW(widenAscii(scaleValue))
+	    << L" -interp " << quoteArgW(widenAscii(interpValue))
+	    << L" -cmap " << quoteArgW(widenAscii(cmapValue))
+	    << L" -temp-offset-c " << quoteArgW(offset)
+	    << L" -filter-preset " << quoteArgW(widenAscii(filterValue))
+	    << L" -bilateral " << quoteArgW(widenAscii(bilateralValue))
+	    << L" -temporal-denoise " << quoteArgW(widenAscii(temporalValue))
+	    << L" -sharpen " << quoteArgW(widenAscii(sharpenValue));
 	if ( fullscreen ) {
-		cmd << " -fullscreen";
+		cmd << L" -fullscreen";
 	}
 	return cmd.str();
 }
 
-static std::string buildCommandLine() {
+static std::wstring buildCommandLine() {
 	return buildCommandLineFromValues(
 		textOf(g_device),
 		comboValue(g_rotation, g_rotationItems),
@@ -271,14 +292,21 @@ static std::string buildCommandLine() {
 		BST_CHECKED == SendMessageA(g_fullscreen, BM_GETCHECK, 0, 0));
 }
 
-static void writeLastCommand(const std::string &commandLine) {
-	std::ofstream out(joinPath(exeDir(), "thermal-camera-redux-last-command.txt").c_str(), std::ios::out | std::ios::trunc);
-	out << commandLine << "\n";
+static void writeLastCommand(const std::wstring &commandLine) {
+	std::string text = utf8FromWide(commandLine) + "\n";
+	HANDLE file = CreateFileW(joinPathW(exeDirW(), L"thermal-camera-redux-last-command.txt").c_str(),
+		GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if ( INVALID_HANDLE_VALUE == file ) {
+		return;
+	}
+	DWORD written = 0;
+	WriteFile(file, text.data(), (DWORD)text.size(), &written, NULL);
+	CloseHandle(file);
 }
 
 static void updatePreview() {
 	if ( g_preview ) {
-		setText(g_preview, buildCommandLine());
+		SetWindowTextW(g_preview, buildCommandLine().c_str());
 	}
 }
 
@@ -417,7 +445,7 @@ static void createControls(HWND hwnd) {
 	y += gap;
 
 	addLabel(hwnd, "Command", labelX, y, labelW, rowH);
-	g_preview = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+	g_preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
 		controlX, y - 2, controlW, 54, hwnd, (HMENU)(INT_PTR)IDC_PREVIEW, NULL, NULL);
 	setFont(g_preview);
 	y += 66;
@@ -432,24 +460,24 @@ static void createControls(HWND hwnd) {
 }
 
 static void launchCamera(HWND hwnd) {
-	std::string dir = exeDir();
-	std::string exe = joinPath(dir, "Thermal-Camera-Redux.exe");
-	if ( ! fileExists(exe) ) {
+	std::wstring dir = exeDirW();
+	std::wstring exe = joinPathW(dir, L"Thermal-Camera-Redux.exe");
+	if ( ! fileExistsW(exe) ) {
 		MessageBoxA(hwnd, "Thermal-Camera-Redux.exe was not found next to the launcher.", APP_TITLE, MB_ICONERROR | MB_OK);
 		return;
 	}
 
-	std::string commandLine = buildCommandLine();
+	std::wstring commandLine = buildCommandLine();
 	writeLastCommand(commandLine);
 	saveSettings();
 
-	STARTUPINFOA si = {};
+	STARTUPINFOW si = {};
 	PROCESS_INFORMATION pi = {};
 	si.cb = sizeof(si);
-	std::vector<char> mutableCommand(commandLine.begin(), commandLine.end());
-	mutableCommand.push_back('\0');
+	std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+	mutableCommand.push_back(L'\0');
 
-	BOOL ok = CreateProcessA(NULL, mutableCommand.data(), NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi);
+	BOOL ok = CreateProcessW(NULL, mutableCommand.data(), NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi);
 	if ( ! ok ) {
 		MessageBoxA(hwnd, "Failed to start Thermal-Camera-Redux.exe.", APP_TITLE, MB_ICONERROR | MB_OK);
 		return;
@@ -494,11 +522,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 static int dryRun() {
-	std::string commandLine = buildCommandLineFromValues(
+	std::wstring commandLine = buildCommandLineFromValues(
 		"0", "90", "4", "cubic", "4", "0.0",
 		"off", "off", "off", "off", false);
 	writeLastCommand(commandLine);
-	return commandLine.find("Thermal-Camera-Redux.exe") == std::string::npos ? 1 : 0;
+	return commandLine.find(L"Thermal-Camera-Redux.exe") == std::wstring::npos ? 1 : 0;
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR cmdLine, int nCmdShow) {
