@@ -10,6 +10,17 @@
 #include <time.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <chrono>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+#define access _access
+#define nice(priority) (0)
+#endif
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
@@ -134,64 +145,55 @@ static int offline_fps = OFFLINE_FPS;
 // timeval  has Seconds and MICRO-seconds
 // timespec has Seconds and NANO-seconds
 void sleepMillis(long millis) {
+#ifdef _WIN32
+	Sleep((DWORD)((millis < 0) ? 0 : millis));
+#else
         struct timespec ts;
         ts.tv_sec  = (millis / MILLIS_PER_SECOND);
         ts.tv_nsec = (millis % MILLIS_PER_SECOND) * 1000 * 1000;
         nanosleep(&ts, NULL);
+#endif
 }
 
 void sleepMicros(long micros) {
+#ifdef _WIN32
+	Sleep((DWORD)((micros <= 0) ? 0 : ((micros + 999) / 1000)));
+#else
         struct timespec ts;
         ts.tv_sec  = (micros / MICROS_PER_SECOND);
         ts.tv_nsec = (micros % MICROS_PER_SECOND) * 1000;
         nanosleep(&ts, NULL);
+#endif
 }
 
 void sleepNanos(long nanos) {
+#ifdef _WIN32
+	Sleep((DWORD)((nanos <= 0) ? 0 : ((nanos + 999999) / 1000000)));
+#else
         struct timespec ts;
         ts.tv_sec  = (nanos / NANOS_PER_SECOND);
         ts.tv_nsec = (nanos % NANOS_PER_SECOND);
         nanosleep(&ts, NULL);
+#endif
 }
 
 
 // Returns the current time in milliseconds.
 int64_t currentTimeMillis() {
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	int64_t s1 = (int64_t)(currentTime.tv_sec  * 1000);
-	int64_t s2 = (int64_t)(currentTime.tv_usec / 1000);
-	return s1 + s2;
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 // Returns the current time in microseconds.
 int64_t currentTimeMicros(){
-#if 1 // More accurate (but slower) than clock_gettime(CLOCK_MONOTONIC_COARSE)
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	return (currentTime.tv_sec * (int)1e6) + currentTime.tv_usec;
-#else
-	// @ 4.5X faster that gettimeofday(), but may drift over time
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-	return ( (ts.tv_sec  * (int)1e6) +
-		 (ts.tv_nsec / 1000) );
-#endif
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
 }
 
 // Returns the current time in microseconds.
 int64_t currentTimeNanos(){
-#if 1 // More accurate (but slower) than clock_gettime(CLOCK_MONOTONIC_COARSE)
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	return (currentTime.tv_sec * NANOS_PER_SECOND) + currentTime.tv_usec;
-#else
-	// @ 4.5X faster that gettimeofday(), but may drift over time
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-	return ( (ts.tv_sec  * NANOS_PER_SECOND) +
-		  ts.tv_nsec  );
-#endif
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
 #if 0
