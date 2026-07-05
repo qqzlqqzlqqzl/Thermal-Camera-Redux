@@ -4951,6 +4951,14 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 		return 0;
 	}
 
+	if ( 1 != frame.channels() && 2 != frame.channels() ) {
+		printf("%sUnsupported converted frame: cols(%d) rows(%d) type(%d) channels(%d). Raw YUYV capture must be CV_8UC1 or CV_8UC2.\n%s",
+			RED_STR(),
+			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
+			RESET_STR());
+		return -1;
+	}
+
 	size_t byteCount = frame.total() * frame.elemSize();
 	int candidateRows[] = { cameraCaptureRows, UTI260B_CAPTURE_ROWS, RAW_TC_ROWS };
 	for (int i = 0; i < ARRAY_COUNT(candidateRows); i++) {
@@ -4994,6 +5002,9 @@ void configureCapture( VideoCapture &cap ) {
 	cap.set(CAP_PROP_FRAME_HEIGHT, cameraCaptureRows);
 	cap.set(CAP_PROP_FPS, offline_fps);
 	cap.set(CAP_PROP_CONVERT_RGB, 0.0);
+#ifdef _WIN32
+	cap.set(CAP_PROP_FORMAT, -1.0);
+#endif
 	cap.set(CAP_PROP_MONOCHROME,  1.0);
 }
 
