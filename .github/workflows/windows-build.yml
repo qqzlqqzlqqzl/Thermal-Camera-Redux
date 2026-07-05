@@ -91,7 +91,7 @@ jobs:
           if ($status -ne 255) {
             Get-ChildItem -Recurse | Sort-Object FullName | Format-Table FullName, Length
             exit $status
-          fi
+          }
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
