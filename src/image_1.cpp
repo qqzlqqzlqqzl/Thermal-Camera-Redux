@@ -68,6 +68,9 @@
 					*threadData.rgbFrameOrig = sourcePtr->clone();
 					useFrameOrig = 1;
 				}
+				if ( threadData.configurationChanged ) {
+					resetDisplayTemporalDenoise();
+				}
 				applyDisplayEnhancements( *threadData.rgbFrameOrig );
 			}
 

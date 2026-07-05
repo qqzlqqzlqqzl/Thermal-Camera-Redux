@@ -1466,7 +1466,7 @@ static void applyDisplayTemporalDenoise( Mat &frame ) {
 	Mat blended;
 	addWeighted( frame, currentWeight, displayTemporalFrame, previousWeight, 0.0, blended );
 	blended.copyTo( displayTemporalFrame );
-	frame = blended;
+	blended.copyTo( frame );
 }
 
 static void applyDisplaySharpen( Mat &frame ) {
@@ -1483,18 +1483,22 @@ static void applyDisplaySharpen( Mat &frame ) {
 		(2 == level) ? 1.0 : 1.2;
 
 	Mat blurred;
+	Mat sharpened;
 	GaussianBlur( frame, blurred, Size(0, 0), sigma );
-	addWeighted( frame, 1.0 + amount, blurred, -amount, 0.0, frame );
+	addWeighted( frame, 1.0 + amount, blurred, -amount, 0.0, sharpened );
+	sharpened.copyTo( frame );
 }
 
-static void applyDisplayEnhancements( Mat &frame ) {
+static void applyDisplaySpatialEnhancements( Mat &frame ) {
 	if ( frame.empty() ) {
 		return;
 	}
 
 	int filterKernel = oddKernelForLevel( controls.displayFilterPreset );
 	if ( 0 < filterKernel ) {
-		GaussianBlur( frame, frame, Size(filterKernel, filterKernel), 0.0 );
+		Mat filtered;
+		GaussianBlur( frame, filtered, Size(filterKernel, filterKernel), 0.0 );
+		filtered.copyTo( frame );
 	}
 
 	int bilateralLevel = clampDisplayLevel( controls.bilateralLevel );
@@ -1504,11 +1508,38 @@ static void applyDisplayEnhancements( Mat &frame ) {
 		double sigmaSpace = (1 == bilateralLevel) ? 3.0 : (2 == bilateralLevel) ? 5.0 : 7.0;
 		Mat filtered;
 		bilateralFilter( frame, filtered, diameter, sigmaColor, sigmaSpace );
-		frame = filtered;
+		filtered.copyTo( frame );
+	}
+
+	applyDisplaySharpen( frame );
+}
+
+static void applyDisplayEnhancements( Mat &frame ) {
+	if ( frame.empty() ) {
+		return;
+	}
+
+	if ( controls.wD &&
+	     WINDOW_DOUBLE_WIDE == controls.windowFormat &&
+	     frame.cols >= (2 * controls.scaledSFWidth) &&
+	     frame.rows >= controls.scaledSFHeight ) {
+		Mat leftPane  = frame( Rect(0, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		Mat rightPane = frame( Rect(controls.scaledSFWidth, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		applyDisplaySpatialEnhancements( leftPane );
+		applyDisplaySpatialEnhancements( rightPane );
+	} else if ( controls.wD &&
+	            WINDOW_DOUBLE_HIGH == controls.windowFormat &&
+	            frame.cols >= controls.scaledSFWidth &&
+	            frame.rows >= (2 * controls.scaledSFHeight) ) {
+		Mat topPane    = frame( Rect(0, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		Mat bottomPane = frame( Rect(0, controls.scaledSFHeight, controls.scaledSFWidth, controls.scaledSFHeight) );
+		applyDisplaySpatialEnhancements( topPane );
+		applyDisplaySpatialEnhancements( bottomPane );
+	} else {
+		applyDisplaySpatialEnhancements( frame );
 	}
 
 	applyDisplayTemporalDenoise( frame );
-	applyDisplaySharpen( frame );
 }
 
 // Optimization: Remove if's from rendering routines by using function pointer

@@ -154,15 +154,16 @@ jobs:
           & .\Thermal-Camera-Redux.exe -help
           $status = $LASTEXITCODE
           Write-Host "Thermal-Camera-Redux.exe -help exited $status"
-          & .\Thermal-Camera-Redux-GUI.exe --dry-run
-          if ($LASTEXITCODE -ne 0) {
-            throw "Thermal-Camera-Redux-GUI.exe --dry-run failed with $LASTEXITCODE"
+          $acceptedHelpExit = ($status -eq 0 -or $status -eq 255 -or $status -eq -1)
+          $guiProcess = Start-Process -FilePath .\Thermal-Camera-Redux-GUI.exe -ArgumentList '--dry-run' -Wait -PassThru
+          if ($guiProcess.ExitCode -ne 0) {
+            throw "Thermal-Camera-Redux-GUI.exe --dry-run failed with $($guiProcess.ExitCode)"
           }
           if (-not (Test-Path .\thermal-camera-redux-last-command.txt)) {
             throw 'GUI dry-run did not write thermal-camera-redux-last-command.txt'
           }
           Get-Content .\thermal-camera-redux-last-command.txt
-          if ($status -ne 255 -and $status -ne -1) {
+          if (-not $acceptedHelpExit) {
             $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
             if (Test-Path $toolchainBin) {
               $env:Path = "$runtimeDir;$toolchainBin;C:\Windows\System32;C:\Windows\System;C:\Windows"
@@ -170,30 +171,34 @@ jobs:
               Write-Host "Thermal-Camera-Redux.exe -help with toolchain PATH exited $LASTEXITCODE"
               $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
             }
-            $depsDir = Join-Path $env:RUNNER_TEMP 'dependencies-cli'
-            $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
-            Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
-            Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
-            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain .\Thermal-Camera-Redux.exe | ConvertFrom-Json -AsHashtable
-            $unresolved = New-Object System.Collections.Generic.List[string]
-            function Find-UnresolvedDependency($node, $parent) {
-              if (-not $node['Filepath']) {
-                $unresolved.Add("parent=$parent module=$($node['ModuleName']) strategy=$($node['SearchStrategy'])")
-              }
-              foreach ($child in @($node['Dependencies'])) {
-                Find-UnresolvedDependency $child $node['ModuleName']
-              }
+          }
+          $depsDir = Join-Path $env:RUNNER_TEMP 'dependencies-cli'
+          $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
+          Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
+          Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
+          $unresolved = New-Object System.Collections.Generic.List[string]
+          function Find-UnresolvedDependency($node, $parent) {
+            if (-not $node['Filepath']) {
+              $unresolved.Add("parent=$parent module=$($node['ModuleName']) strategy=$($node['SearchStrategy'])")
             }
-            Find-UnresolvedDependency $depJson['Root'] '<root>'
-            if ($unresolved.Count -eq 0) {
-              Write-Host 'DEP_UNRESOLVED none'
-            } else {
-              $unresolved | Sort-Object -Unique | ForEach-Object { Write-Host "DEP_UNRESOLVED $_" }
+            foreach ($child in @($node['Dependencies'])) {
+              Find-UnresolvedDependency $child $node['ModuleName']
             }
-            $files = Get-ChildItem -Recurse -File
-            $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
-            Write-Host "Runtime files: count=$($files.Count) bytes=$totalBytes"
-            $files | Sort-Object Length -Descending | Select-Object -First 20 FullName, Length | Format-Table FullName, Length
+          }
+          foreach ($binary in @('.\Thermal-Camera-Redux.exe', '.\Thermal-Camera-Redux-GUI.exe')) {
+            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain $binary | ConvertFrom-Json -AsHashtable
+            Find-UnresolvedDependency $depJson['Root'] $binary
+          }
+          if ($unresolved.Count -eq 0) {
+            Write-Host 'DEP_UNRESOLVED none'
+          } else {
+            $unresolved | Sort-Object -Unique | ForEach-Object { Write-Host "DEP_UNRESOLVED $_" }
+          }
+          $files = Get-ChildItem -Recurse -File
+          $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+          Write-Host "Runtime files: count=$($files.Count) bytes=$totalBytes"
+          $files | Sort-Object Length -Descending | Select-Object -First 20 FullName, Length | Format-Table FullName, Length
+          if (-not $acceptedHelpExit) {
             exit $status
           }
           exit 0
