@@ -90,16 +90,17 @@ jobs:
           $status = $LASTEXITCODE
           Write-Host "Thermal-Camera-Redux.exe -help exited $status"
           if ($status -ne 255 -and $status -ne -1) {
-            Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class Win32Load {
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr LoadLibraryW(string fileName);
-    [DllImport("kernel32.dll")]
-    public static extern bool FreeLibrary(IntPtr module);
-}
-"@
+            $signature = @(
+              'using System;'
+              'using System.Runtime.InteropServices;'
+              'public static class Win32Load {'
+              '    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]'
+              '    public static extern IntPtr LoadLibraryW(string fileName);'
+              '    [DllImport("kernel32.dll")]'
+              '    public static extern bool FreeLibrary(IntPtr module);'
+              '}'
+            ) -join [Environment]::NewLine
+            Add-Type -TypeDefinition $signature
             Get-ChildItem -Filter *.dll | Sort-Object Name | ForEach-Object {
               $handle = [Win32Load]::LoadLibraryW($_.FullName)
               if ($handle -eq [IntPtr]::Zero) {
