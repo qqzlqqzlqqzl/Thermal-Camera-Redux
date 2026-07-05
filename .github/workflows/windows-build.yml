@@ -53,8 +53,9 @@ jobs:
             -DWITH_OPENGL=OFF \
             -DWITH_FFMPEG=OFF \
             -DWITH_GSTREAMER=OFF \
-            -DWITH_MSMF=ON \
+            -DWITH_MSMF=OFF \
             -DWITH_DSHOW=ON \
+            -DVIDEOIO_ENABLE_PLUGINS=OFF \
             -DWITH_OPENCL=OFF \
             -DWITH_TBB=OFF \
             -DWITH_OPENMP=OFF \

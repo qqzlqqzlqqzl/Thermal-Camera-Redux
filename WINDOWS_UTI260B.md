@@ -9,10 +9,13 @@ used by `USB\VID_0BDA&PID_3901`.
 - The local Windows machine does not need MSYS2, OpenCV headers, or OpenCV
   development libraries to run the packaged build.
 - The uploaded artifact is intended to be the distributable runtime folder:
-  `Thermal-Camera-Redux.exe`, the required runtime DLLs, optional Qt/OpenCV
-  runtime plugins, and `run_uti260b_windows.cmd`.
+  `Thermal-Camera-Redux.exe`, only the required runtime DLLs, and
+  `run_uti260b_windows.cmd`.
 - Do not redistribute the full OpenCV SDK, headers, import libraries, or MSYS2
   package cache with the runtime folder.
+- The Windows CI build compiles a minimal OpenCV with Win32 UI and DirectShow
+  enabled, while Qt, FFmpeg, GStreamer, Media Foundation, OpenCL, tests, docs,
+  Python, Java, and examples are disabled to keep the runtime small.
 
 ## Run
 
