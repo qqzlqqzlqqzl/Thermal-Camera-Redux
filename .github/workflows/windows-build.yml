@@ -88,7 +88,8 @@ jobs:
           $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
           & .\Thermal-Camera-Redux.exe -help
           $status = $LASTEXITCODE
-          if ($status -ne 255) {
+          Write-Host "Thermal-Camera-Redux.exe -help exited $status"
+          if ($status -ne 255 -and $status -ne -1) {
             Get-ChildItem -Recurse | Sort-Object FullName | Format-Table FullName, Length
             exit $status
           }
