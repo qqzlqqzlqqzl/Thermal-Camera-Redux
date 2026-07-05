@@ -3559,8 +3559,9 @@ void printInfo() {
 	  DISPLAY_WIDTH, DISPLAY_HEIGHT, MAX_SCALE_STEPS, TC_DEF_SCALE, ROTATION_STR,
 	  USE_CELSIUS?"Celsius":"Fahrenheit", MAX_CMAPS, cmaps[controls.cmapCurrent]->name
        	);
-  printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C\n",
-	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius);
+  printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C, display rotation %d\n",
+	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius,
+	  RotateDisplay * 90);
   printf("    %s-threaded with %s scrolling\n",
 
 #if DRAW_SINGLE_THREAD
@@ -5638,7 +5639,8 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 				RotateDisplay = 0;
 			}
 			ResetRotateDisplay = RotateDisplay;
-			rotateDisplay( ptf, 0 );
+			setHeightWidth();
+			setWindowFormat();
 			i++;
 		} else if (( ! strcmp( argv[i], "-f"    ) ||
 			     ! strcmp( argv[i], "-file" ) ) && hasNext ) {
