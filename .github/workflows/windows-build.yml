@@ -7,6 +7,9 @@ on:
 jobs:
   build:
     runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      OPENCV_VERSION: 4.10.0
     defaults:
       run:
         shell: msys2 {0}
@@ -19,8 +22,58 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-opencv
+            unzip
+
+      - name: Build minimal OpenCV
+        run: |
+          set -euxo pipefail
+          curl -L --retry 5 -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"
+          unzip -q opencv.zip
+          cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/opencv-install" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio \
+            -DOPENCV_GENERATE_PKGCONFIG=ON \
+            -DBUILD_opencv_apps=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_PERF_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_JAVA=OFF \
+            -DBUILD_PROTOBUF=OFF \
+            -DBUILD_opencv_python2=OFF \
+            -DBUILD_opencv_python3=OFF \
+            -DWITH_QT=OFF \
+            -DWITH_GTK=OFF \
+            -DWITH_WIN32UI=ON \
+            -DWITH_OPENGL=OFF \
+            -DWITH_FFMPEG=OFF \
+            -DWITH_GSTREAMER=OFF \
+            -DWITH_MSMF=ON \
+            -DWITH_DSHOW=ON \
+            -DWITH_OPENCL=OFF \
+            -DWITH_TBB=OFF \
+            -DWITH_OPENMP=OFF \
+            -DWITH_LAPACK=OFF \
+            -DWITH_IPP=OFF \
+            -DWITH_ITT=OFF \
+            -DWITH_PROTOBUF=OFF \
+            -DWITH_JPEG=ON \
+            -DWITH_PNG=ON \
+            -DWITH_TIFF=OFF \
+            -DWITH_WEBP=OFF \
+            -DWITH_OPENEXR=OFF \
+            -DWITH_JASPER=OFF \
+            -DWITH_OPENJPEG=OFF \
+            -DBUILD_JPEG=ON \
+            -DBUILD_PNG=ON \
+            -DBUILD_ZLIB=ON
+          cmake --build opencv-build --target install --parallel 2
+          find opencv-install -maxdepth 5 -type f \( -iname '*.dll' -o -name 'opencv4.pc' \) -print | sort
 
       - name: Build redux.exe
         working-directory: src
@@ -28,8 +81,10 @@ jobs:
           set -euxo pipefail
           DEFAULT_FLAGS='-DBORDER_LAYOUT=0 -DDEFAULT_FONT=0 -DDEFAULT_COLORMAP=4 -DROTATION=0 -DDISPLAY_WIDTH=2560 -DDISPLAY_HEIGHT=1600 -DUSE_CELSIUS=0 -DHUD_ALPHA=0.4'
           CFLAGS='-march=x86-64 -mtune=generic -pipe -fomit-frame-pointer'
-          OPENCV_LIBS='-lopencv_videoio -lopencv_highgui -lopencv_imgcodecs -lopencv_imgproc -lopencv_core'
-          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 tc001.cpp thread.cpp -o redux.exe -lpthread $(pkg-config --cflags opencv4) ${OPENCV_LIBS}
+          export OPENCV_PREFIX="$PWD/../opencv-install"
+          export PKG_CONFIG_PATH="$OPENCV_PREFIX/x64/mingw/lib/pkgconfig:$OPENCV_PREFIX/lib/pkgconfig"
+          pkg-config --cflags --libs opencv4
+          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 tc001.cpp thread.cpp -o redux.exe -lpthread $(pkg-config --cflags --libs opencv4)
           ldd redux.exe | tee ../redux-ldd.txt
           ! grep "not found" ../redux-ldd.txt | grep -vi "api-ms-win-crt-"
 
@@ -40,6 +95,10 @@ jobs:
           mkdir -p ../dist/windows-x64
           cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
+          OPENCV_BIN="$PWD/../opencv-install/x64/mingw/bin"
+          if [ ! -d "$OPENCV_BIN" ]; then
+            OPENCV_BIN="$PWD/../opencv-install/bin"
+          fi
           declare -A copied
           copy_mingw_deps() {
             local queue=("$1")
@@ -53,7 +112,7 @@ jobs:
                   continue
                 fi
                 local dll_path
-                dll_path="$(find "$MINGW_PREFIX/bin" -maxdepth 1 -iname "$dll_name" -print -quit)"
+                dll_path="$(find "$OPENCV_BIN" "$MINGW_PREFIX/bin" -maxdepth 1 -iname "$dll_name" -print -quit)"
                 if [ -z "$dll_path" ]; then
                   continue
                 fi
@@ -64,16 +123,9 @@ jobs:
             done
           }
           copy_mingw_deps redux.exe
-          find "$MINGW_PREFIX/bin" -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
+          find "$OPENCV_BIN" -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
           find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
             copy_mingw_deps "$plugin"
-          done
-          for qt_plugins in "$MINGW_PREFIX/share/qt6/plugins" "$MINGW_PREFIX/share/qt5/plugins"; do
-            if [ -f "$qt_plugins/platforms/qwindows.dll" ]; then
-              mkdir -p ../dist/windows-x64/platforms
-              cp -n "$qt_plugins/platforms/qwindows.dll" ../dist/windows-x64/platforms/
-              printf '[Paths]\nPlugins=.\n' > ../dist/windows-x64/qt.conf
-            fi
           done
           du -sh ../dist/windows-x64
           find ../dist/windows-x64 -maxdepth 2 -type f -printf '%P\n' | sort
