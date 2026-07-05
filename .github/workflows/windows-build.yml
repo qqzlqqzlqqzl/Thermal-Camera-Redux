@@ -80,14 +80,17 @@ jobs:
 
       - name: Smoke test packaged binary
         working-directory: dist/windows-x64
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          export PATH="$(pwd):/c/Windows/System32:/c/Windows/System:/c/Windows"
-          status=0
-          ./Thermal-Camera-Redux.exe -help || status="$?"
-          if [ "$status" -ne 255 ]; then
-            PATH="$(pwd):/usr/bin:/c/Windows/System32:/c/Windows/System:/c/Windows" ldd ./Thermal-Camera-Redux.exe || true
-            exit "$status"
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $runtimeDir = (Get-Location).Path
+          $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
+          & .\Thermal-Camera-Redux.exe -help
+          $status = $LASTEXITCODE
+          if ($status -ne 255) {
+            Get-ChildItem -Recurse | Sort-Object FullName | Format-Table FullName, Length
+            exit $status
           fi
 
       - name: Upload binary
