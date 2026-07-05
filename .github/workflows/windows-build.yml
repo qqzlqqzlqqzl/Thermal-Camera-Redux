@@ -101,17 +101,17 @@ jobs:
             $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
             Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
             Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
-            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain .\Thermal-Camera-Redux.exe | ConvertFrom-Json
+            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain .\Thermal-Camera-Redux.exe | ConvertFrom-Json -AsHashtable
             $unresolved = New-Object System.Collections.Generic.List[string]
             function Find-UnresolvedDependency($node, $parent) {
-              if (-not $node.Filepath) {
-                $unresolved.Add("parent=$parent module=$($node.ModuleName) strategy=$($node.SearchStrategy)")
+              if (-not $node['Filepath']) {
+                $unresolved.Add("parent=$parent module=$($node['ModuleName']) strategy=$($node['SearchStrategy'])")
               }
-              foreach ($child in @($node.Dependencies)) {
-                Find-UnresolvedDependency $child $node.ModuleName
+              foreach ($child in @($node['Dependencies'])) {
+                Find-UnresolvedDependency $child $node['ModuleName']
               }
             }
-            Find-UnresolvedDependency $depJson.Root '<root>'
+            Find-UnresolvedDependency $depJson['Root'] '<root>'
             if ($unresolved.Count -eq 0) {
               Write-Host 'DEP_UNRESOLVED none'
             } else {
