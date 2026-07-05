@@ -4942,6 +4942,16 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 	}
 
 	Mat frame = captureFrame.isContinuous() ? captureFrame : captureFrame.clone();
+	size_t byteCount = frame.total() * frame.elemSize();
+	static int captureFrameInfoPrinted = 0;
+	if ( ! captureFrameInfoPrinted ) {
+		printf("%sCaptured frame: cols(%d) rows(%d) type(%d) channels(%d) elemSize(%zu) bytes(%zu)\n%s",
+			BLUE_STR(),
+			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
+			captureFrame.elemSize(), byteCount,
+			RESET_STR());
+		captureFrameInfoPrinted = 1;
+	}
 
 	if ( CV_8UC2 == frame.type() &&
 	     frame.cols >= FIXED_TC_WIDTH &&
@@ -4951,7 +4961,7 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 		return 0;
 	}
 
-	if ( 1 != frame.channels() && 2 != frame.channels() ) {
+	if ( CV_8UC1 != frame.type() && CV_8UC2 != frame.type() ) {
 		printf("%sUnsupported converted frame: cols(%d) rows(%d) type(%d) channels(%d). Raw YUYV capture must be CV_8UC1 or CV_8UC2.\n%s",
 			RED_STR(),
 			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
@@ -4959,7 +4969,6 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 		return -1;
 	}
 
-	size_t byteCount = frame.total() * frame.elemSize();
 	int candidateRows[] = { cameraCaptureRows, UTI260B_CAPTURE_ROWS, RAW_TC_ROWS };
 	for (int i = 0; i < ARRAY_COUNT(candidateRows); i++) {
 		int rows = candidateRows[i];
@@ -4972,10 +4981,11 @@ int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
 			continue;
 		}
 
-		int pixelsPerRow = (int)(bytesPerRow / 2);
-		if ( pixelsPerRow < FIXED_TC_WIDTH ) {
+		if ( bytesPerRow != (size_t)(FIXED_TC_WIDTH * 2) ) {
 			continue;
 		}
+
+		int pixelsPerRow = (int)(bytesPerRow / 2);
 
 		Mat yuyvRows(rows, pixelsPerRow, CV_8UC2, frame.data);
 		Mat visibleRows = yuyvRows( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
