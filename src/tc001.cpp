@@ -2286,8 +2286,6 @@ void resetDefaults() {
 	controls.roiRectPercent       = 25;
 	controls.isothermEnabled      = 0;
 	controls.isothermThresholdC   = 60.0f;
-	controls.recordingWidth       = 0;
-	controls.recordingHeight      = 0;
 	resetDisplayTemporalDenoise();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
@@ -2446,6 +2444,8 @@ void setDefaults(ProcessedThermalFrame *ptf) {
 	controls.recFrameCounter = 0;
 	ptf->rColor              = &WHITE;
 	controls.recording       = 0;
+	controls.recordingWidth  = 0;
+	controls.recordingHeight = 0;
 	controls.fullscreen      = 0;
 	controls.lastHelpScale   = -1; // trigger Help to be redrawn
 	controls.windowFormat    = WINDOW_IMAGE;
@@ -4088,6 +4088,7 @@ FILTER_TYPE_CHANGE:
 
 		case '1': 
 			  threadData.configurationChanged++;
+			  if ( controls.recording ) { recording(ptf, 1); } // Font metrics can change BORDER_LAYOUT recording size
 			  UserFont = ( UserFont + 1 ) % MAX_USER_FONT;
 			  setScaleControls();
 			  break;
