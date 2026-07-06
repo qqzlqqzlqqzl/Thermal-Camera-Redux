@@ -152,6 +152,8 @@ using namespace cv;
 static int offline_fps = OFFLINE_FPS;
 static long perfFrameInterval = (long)(20.0 * 25.0);
 static long benchmarkFrames = 0;
+static int64_t benchmarkFrameCounter = 0;
+static int resetPerfCountersRequested = 0;
 
 #define helpLineType		LINE_8
 #define hudLineType		LINE_8
@@ -330,6 +332,7 @@ static float kelvinScale = 64.0;
 static float temperatureOffsetCelsius = 0.0;
 static float temperatureDriftCelsiusPerMinute = 0.0;
 static int64_t temperatureDriftStartMillis = 0;
+static const char *CALIBRATION_STATUS_FILE = "thermal-camera-redux-calibration-status.txt";
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -1325,22 +1328,20 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 
 #else
 
-float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	float driftCelsius = 0.0f;
+static float currentTemperatureDriftCelsius() {
 	if ( 0 != temperatureDriftStartMillis && 0.0f != temperatureDriftCelsiusPerMinute ) {
-		driftCelsius = (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
+		return (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
 			temperatureDriftCelsiusPerMinute;
 	}
-	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius + driftCelsius );
+	return 0.0f;
+}
+
+float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
+	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius + currentTemperatureDriftCelsius() );
 }
 
 static unsigned short displayedCelsiusToKelvin(float celsius) {
-	float driftCelsius = 0.0f;
-	if ( 0 != temperatureDriftStartMillis && 0.0f != temperatureDriftCelsiusPerMinute ) {
-		driftCelsius = (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
-			temperatureDriftCelsiusPerMinute;
-	}
-	float rawCelsius = celsius - temperatureOffsetCelsius - driftCelsius;
+	float rawCelsius = celsius - temperatureOffsetCelsius - currentTemperatureDriftCelsius();
 	float kelvin = (rawCelsius + 273.15f) * kelvinScale;
 	if ( kelvin < 0.0f ) {
 		kelvin = 0.0f;
@@ -4106,6 +4107,7 @@ void printUsage() {
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
   printf( "                 [-control-pipe name] for live Windows GUI controls\n");
+  printf( "                 live control: calibrate blackbody targetC [roiPercent] [requestId]\n");
   printf( "                 [-perf-frames n] [-benchmark-frames n] for deterministic CLI performance tests\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
@@ -4858,17 +4860,32 @@ static void drawSpotOverlay( Mat &frame, ProcessedThermalFrame *ptf ) {
 	drawOverlayText( frame, buf, textLoc, YELLOW );
 }
 
-static void drawRectRoiOverlay( Mat &frame ) {
+struct RoiTemperatureStats {
+	bool valid;
+	int percent;
+	unsigned long count;
+	float minC;
+	float avgC;
+	float maxC;
+};
+
+static RoiTemperatureStats centerRoiTemperatureStats( int requestedPercent ) {
+	RoiTemperatureStats stats = {};
+	stats.valid = false;
+	stats.percent = requestedPercent;
+	stats.count = 0;
+
 	if ( thermalFrame.empty() ) {
-		return;
+		return stats;
 	}
 
-	int percent = controls.roiRectPercent;
+	int percent = requestedPercent;
 	if ( percent < 5 ) {
 		percent = 5;
 	} else if ( percent > 100 ) {
 		percent = 100;
 	}
+	stats.percent = percent;
 
 	int roiW = max( 1, (TC_WIDTH  * percent) / 100 );
 	int roiH = max( 1, (TC_HEIGHT * percent) / 100 );
@@ -4895,8 +4912,36 @@ static void drawRectRoiOverlay( Mat &frame ) {
 		}
 	}
 	if ( 0 == count ) {
+		return stats;
+	}
+
+	stats.valid = true;
+	stats.count = count;
+	stats.minC = kelvin2Celsius( minKelvin );
+	stats.avgC = kelvin2Celsius( (unsigned short)( totalKelvin / count ) );
+	stats.maxC = kelvin2Celsius( maxKelvin );
+	return stats;
+}
+
+static RoiTemperatureStats emptyRoiTemperatureStats( int requestedPercent ) {
+	RoiTemperatureStats stats = {};
+	stats.valid = false;
+	stats.percent = max( 5, min( 100, requestedPercent ) );
+	stats.count = 0;
+	return stats;
+}
+
+static void drawRectRoiOverlay( Mat &frame ) {
+	RoiTemperatureStats stats = centerRoiTemperatureStats( controls.roiRectPercent );
+	if ( ! stats.valid ) {
 		return;
 	}
+
+	int percent = stats.percent;
+	int roiW = max( 1, (TC_WIDTH  * percent) / 100 );
+	int roiH = max( 1, (TC_HEIGHT * percent) / 100 );
+	int roiX = (TC_WIDTH  - roiW) / 2;
+	int roiY = (TC_HEIGHT - roiH) / 2;
 
 	Rect pane = displayPaneRect( frame );
 	Rect scaledRoi( pane.x + roiX * MyScale, pane.y + roiY * MyScale,
@@ -4909,12 +4954,9 @@ static void drawRectRoiOverlay( Mat &frame ) {
 	rectangle( frame, scaledRoi, BLACK, 3, LINE_AA );
 	rectangle( frame, scaledRoi, GREEN, 1, LINE_AA );
 
-	float minC = kelvin2Celsius( minKelvin );
-	float avgC = kelvin2Celsius( (unsigned short)( totalKelvin / count ) );
-	float maxC = kelvin2Celsius( maxKelvin );
 	char buf[160];
 	snprintf( buf, sizeof(buf), "ROI min %.1f avg %.1f max %.1f%s",
-	          CorF(minC), CorF(avgC), CorF(maxC), controls.labelCF );
+	          CorF(stats.minC), CorF(stats.avgC), CorF(stats.maxC), controls.labelCF );
 	Point textLoc( scaledRoi.x, max( pane.y + 18, scaledRoi.y - 6 ) );
 	drawOverlayText( frame, buf, textLoc, GREEN );
 }
@@ -6879,6 +6921,119 @@ static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &nam
 	threadData.configurationChanged++;
 }
 
+static void writeBlackbodyCalibrationStatus(
+	const std::string &requestId,
+	const char *status,
+	const char *reason,
+	float targetC,
+	const RoiTemperatureStats &stats,
+	float deltaC,
+	float offsetC,
+	float driftC,
+	int driftReset ) {
+	FILE *fp = fopen( CALIBRATION_STATUS_FILE, "w" );
+	if ( fp ) {
+		fprintf( fp,
+			"blackbody-calibration id=%s status=%s reason=%s target_c=%.3f measured_c=%.3f delta_c=%.3f offset_c=%.3f drift_c=%.3f drift_reset=%d roi_percent=%d samples=%lu\n",
+			requestId.empty() ? "-" : requestId.c_str(),
+			status ? status : "unknown",
+			reason ? reason : "-",
+			targetC,
+			stats.valid ? stats.avgC : 0.0f,
+			deltaC,
+			offsetC,
+			driftC,
+			driftReset,
+			stats.percent,
+			stats.count );
+		fclose( fp );
+	}
+}
+
+static void calibrateBlackbodyOffset( float targetC, int roiPercent, const std::string &requestId ) {
+	RoiTemperatureStats stats = centerRoiTemperatureStats( roiPercent );
+	if ( !(targetC > -100.0f && targetC < 300.0f) ) {
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", targetC, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=%.3f\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetC);
+		FF();
+		return;
+	}
+	if ( ! stats.valid ) {
+		writeBlackbodyCalibrationStatus( requestId, "error", "no-frame", targetC, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=no-frame target_c=%.3f roi_percent=%d\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetC, stats.percent);
+		FF();
+		return;
+	}
+
+	float oldOffset = temperatureOffsetCelsius;
+	float activeDrift = currentTemperatureDriftCelsius();
+	float deltaC = targetC - stats.avgC;
+	int driftReset = (0.0001f < fabs(activeDrift)) || (0.0001f < fabs(temperatureDriftCelsiusPerMinute));
+	temperatureOffsetCelsius += activeDrift + deltaC;
+	temperatureDriftCelsiusPerMinute = 0.0f;
+	temperatureDriftStartMillis = currentTimeMillis();
+	controls.roiMode = ROI_MODE_RECT;
+	controls.roiRectPercent = stats.percent;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+
+	writeBlackbodyCalibrationStatus( requestId, "ok", "-", targetC, stats, deltaC, temperatureOffsetCelsius, activeDrift, driftReset );
+	printf("Blackbody calibration id=%s status=ok target_c=%.3f measured_c=%.3f delta_c=%.3f offset_c=%.3f old_offset_c=%.3f drift_c=%.3f drift_reset=%d roi_percent=%d samples=%lu\n",
+		requestId.empty() ? "-" : requestId.c_str(),
+		targetC, stats.avgC, deltaC, temperatureOffsetCelsius, oldOffset, activeDrift, driftReset, stats.percent, stats.count);
+	FF();
+}
+
+static void parseBlackbodyCalibrationCommand( std::istringstream &iss, bool hasModeToken ) {
+	if ( hasModeToken ) {
+		std::string mode;
+		iss >> mode;
+		mode = lowerControlString( mode );
+		if ( mode != "blackbody" && mode != "black-body" && mode != "uniform" ) {
+			return;
+		}
+	}
+	int roiPercent = controls.roiRectPercent;
+	std::string targetText;
+	std::string roiText;
+	std::string requestId;
+	if ( iss >> targetText ) {
+		if ( iss >> roiText ) {
+			char *roiEnd = 0x00;
+			long parsedRoi = strtol( roiText.c_str(), &roiEnd, 10 );
+			if ( roiEnd != roiText.c_str() && '\0' == *roiEnd ) {
+				roiPercent = max( 5, min( 100, (int)parsedRoi ) );
+				if ( iss >> requestId ) {
+					requestId = trimControlString( requestId );
+				}
+			} else {
+				requestId = trimControlString( roiText );
+			}
+		}
+	} else {
+		RoiTemperatureStats stats = emptyRoiTemperatureStats( roiPercent );
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", 0.0f, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=missing\n",
+			requestId.empty() ? "-" : requestId.c_str());
+		FF();
+		return;
+	}
+
+	char *targetEnd = 0x00;
+	double parsedTarget = strtod( targetText.c_str(), &targetEnd );
+	if ( targetEnd == targetText.c_str() || '\0' != *targetEnd ) {
+		RoiTemperatureStats stats = emptyRoiTemperatureStats( roiPercent );
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", 0.0f, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=%s\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetText.c_str());
+		FF();
+		return;
+	}
+	calibrateBlackbodyOffset( (float)parsedTarget, roiPercent, requestId );
+}
+
 static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame *ptf, Mat *frame ) {
 	std::string trimmed = trimControlString( line );
 	if ( trimmed.empty() ) {
@@ -6912,6 +7067,18 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 		std::string preset;
 		iss >> preset;
 		setRuntimePreset( ptf, preset );
+		return;
+	}
+	if ( command == "perf-reset" || command == "benchmark-reset" ) {
+		resetPerfCountersRequested = 1;
+		return;
+	}
+	if ( command == "calibrate" || command == "calibration" ) {
+		parseBlackbodyCalibrationCommand( iss, true );
+		return;
+	}
+	if ( command == "blackbody" || command == "blackbody-calibrate" || command == "blackbody-calibration" ) {
+		parseBlackbodyCalibrationCommand( iss, false );
 		return;
 	}
 	if ( command != "set" ) {
@@ -7017,6 +7184,8 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 	} else if ( key == "histogram" ) {
 		Use_Histogram = parseControlBool( lowerValue ) ? 1 : 0;
 		threadData.configurationChanged++;
+	} else if ( key == "perf-reset" || key == "benchmark-reset" ) {
+		resetPerfCountersRequested = 1;
 	}
 }
 
@@ -7296,8 +7465,11 @@ int mainPrivate (int argc, char *argv[]) {
 	pthread_t imageThread;   pthread_create( &imageThread,   NULL, imageDataThread,   (void*) &threadData );
 	pthread_t thermalThread; pthread_create( &thermalThread, NULL, thermalDataThread, (void*) &threadData );
 #endif
-	// Read keyboard input from launching terminal or command file piped into stdin
-	pthread_t stdinThread;   pthread_create( &stdinThread,   NULL, stdinDataThread,   (void*) &threadData );
+	// Benchmark runs stop from frame count and should not keep a blocking stdin reader alive.
+	pthread_t stdinThread;
+	if ( benchmarkFrames <= 0 ) {
+		pthread_create( &stdinThread, NULL, stdinDataThread, (void*) &threadData );
+	}
 
 	RenderData  rdMain;
 	Rect        osdROI;
@@ -7586,6 +7758,7 @@ int mainPrivate (int argc, char *argv[]) {
 
 			// Calc FPS
 			controls.frameCounter++;
+			benchmarkFrameCounter++;
 
 			int64_t now    = currentTimeMillis();
 			double seconds = (double)(now - controls.startMills) / (double)1000.0;
@@ -7799,9 +7972,20 @@ int mainPrivate (int argc, char *argv[]) {
 
 		TS( threadData.mainMicros += currentTimeMicros() - mainMicros; ) // track linear read and processing
 
+		int perfCountersWereReset = 0;
+		if ( resetPerfCountersRequested ) {
+			resetFrameCounter();
+			threadData.thermMicros = threadData.imageMicros = threadData.rotMicros    = 0;
+			threadData.horizMicros = threadData.vertMicros  = 0;
+			threadData.mainMicros  = threadData.readMicros  = threadData.imshowMicros = 0;
+			rdMain.renderMicros = 0;
+			resetPerfCountersRequested = 0;
+			perfCountersWereReset = 1;
+		}
+
 #define N_FRAMES ((double)perfFrameInterval) // Stat log average timings every N_FRAMES
 
-		if (0 == (controls.frameCounter % perfFrameInterval)) {
+		if ( ! perfCountersWereReset && 0 == (controls.frameCounter % perfFrameInterval)) {
 
 		    if ( ! quietStdout ) {
 
@@ -7941,7 +8125,7 @@ int mainPrivate (int argc, char *argv[]) {
 			break;
 		}
 
-		if (0 < benchmarkFrames && controls.frameCounter >= benchmarkFrames) {
+		if (0 < benchmarkFrames && benchmarkFrameCounter >= benchmarkFrames) {
 			break;
 		}
 

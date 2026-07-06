@@ -61,9 +61,12 @@ static const int IDC_DRIFT = 1034;
 static const int IDC_CONTRAST = 1035;
 static const int IDC_TEMP_UNIT = 1036;
 static const int IDC_AI_SUPERRES = 1037;
+static const int IDC_BLACKBODY_TARGET = 1038;
+static const int IDC_BLACKBODY_CALIBRATE = 1039;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
+static const UINT_PTR TIMER_CALIBRATION_STATUS = 3;
 
 static HWND g_main;
 static HWND g_language;
@@ -76,6 +79,8 @@ static HWND g_cmap;
 static HWND g_tempUnit;
 static HWND g_offset;
 static HWND g_drift;
+static HWND g_blackbodyTarget;
+static HWND g_blackbodyCalibrate;
 static HWND g_filter;
 static HWND g_bilateral;
 static HWND g_temporal;
@@ -115,6 +120,8 @@ static HANDLE g_process = NULL;
 static HANDLE g_pipe = INVALID_HANDLE_VALUE;
 static DWORD g_processId = 0;
 static std::string g_pipeName;
+static std::string g_pendingCalibrationId;
+static int g_calibrationPolls = 0;
 
 static std::vector<ComboItem> g_languageItems = {
 	{ L"中文", L"中文", "zh-CN" },
@@ -567,8 +574,120 @@ static void updatePreview() {
 	}
 }
 
+static void saveSettings();
+
 static void setStatus(const wchar_t *en, const wchar_t *zh) {
 	SetWindowTextW(g_status, g_zh ? zh : en);
+}
+
+static void setDynamicStatus(const std::wstring &en, const std::wstring &zh) {
+	SetWindowTextW(g_status, g_zh ? zh.c_str() : en.c_str());
+}
+
+static std::wstring calibrationStatusPathW() {
+	return joinPathW(exeDirW(), L"thermal-camera-redux-calibration-status.txt");
+}
+
+static std::string readSmallTextFileW(const std::wstring &path) {
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if ( INVALID_HANDLE_VALUE == file ) {
+		return std::string();
+	}
+	DWORD size = GetFileSize(file, NULL);
+	if ( INVALID_FILE_SIZE == size || size > 4096 ) {
+		CloseHandle(file);
+		return std::string();
+	}
+	std::string text(size, '\0');
+	DWORD read = 0;
+	if ( size > 0 ) {
+		ReadFile(file, &text[0], size, &read, NULL);
+		text.resize(read);
+	}
+	CloseHandle(file);
+	return text;
+}
+
+static std::string statusToken(const std::string &text, const std::string &key) {
+	std::string needle = key + "=";
+	size_t start = text.find(needle);
+	if ( start == std::string::npos ) {
+		return std::string();
+	}
+	start += needle.size();
+	size_t end = text.find_first_of(" \r\n\t", start);
+	if ( end == std::string::npos ) {
+		end = text.size();
+	}
+	return text.substr(start, end - start);
+}
+
+static void applyCalibrationStatusText(HWND hwnd, const std::string &text) {
+	std::string status = statusToken(text, "status");
+	std::string reason = statusToken(text, "reason");
+	std::string target = statusToken(text, "target_c");
+	std::string measured = statusToken(text, "measured_c");
+	std::string delta = statusToken(text, "delta_c");
+	std::string offset = statusToken(text, "offset_c");
+	std::string driftReset = statusToken(text, "drift_reset");
+	std::string roi = statusToken(text, "roi_percent");
+	if ( status == "ok" ) {
+		g_suppressEvents = true;
+		setText(g_offset, widenAscii(offset));
+		if ( driftReset == "1" ) {
+			setText(g_drift, L"0.0");
+		}
+		g_suppressEvents = false;
+		saveSettings();
+		updatePreview();
+
+		std::wostringstream en;
+		en << L"Blackbody calibrated: target " << widenAscii(target)
+		   << L" C, measured " << widenAscii(measured)
+		   << L" C, delta " << widenAscii(delta)
+		   << L" C, offset " << widenAscii(offset)
+		   << L" C, ROI " << widenAscii(roi) << L"%.";
+		std::wostringstream zh;
+		zh << L"黑体校准完成：目标 " << widenAscii(target)
+		   << L" C，测量 " << widenAscii(measured)
+		   << L" C，补偿 " << widenAscii(delta)
+		   << L" C，偏移 " << widenAscii(offset)
+		   << L" C，ROI " << widenAscii(roi) << L"%。";
+		if ( driftReset == "1" ) {
+			en << L" Drift was folded into offset and reset.";
+			zh << L" 温漂已折算进偏移并清零。";
+		}
+		setDynamicStatus(en.str(), zh.str());
+	} else {
+		std::wostringstream en;
+		en << L"Blackbody calibration failed: " << widenAscii(reason.empty() ? "unknown" : reason) << L".";
+		std::wostringstream zh;
+		zh << L"黑体校准失败：" << widenAscii(reason.empty() ? "unknown" : reason) << L"。";
+		setDynamicStatus(en.str(), zh.str());
+	}
+	KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
+	g_pendingCalibrationId.clear();
+	g_calibrationPolls = 0;
+}
+
+static void pollCalibrationStatus(HWND hwnd) {
+	if ( g_pendingCalibrationId.empty() ) {
+		KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
+		return;
+	}
+	std::string text = readSmallTextFileW(calibrationStatusPathW());
+	if ( ! text.empty() && statusToken(text, "id") == g_pendingCalibrationId ) {
+		applyCalibrationStatusText(hwnd, text);
+		return;
+	}
+	g_calibrationPolls++;
+	if ( g_calibrationPolls > 24 ) {
+		KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
+		g_pendingCalibrationId.clear();
+		g_calibrationPolls = 0;
+		setStatus(L"Calibration command sent, but no result was returned.", L"已发送校准命令，但未收到结果。");
+	}
 }
 
 static void saveSettings() {
@@ -582,6 +701,7 @@ static void saveSettings() {
 	writeIni("temp_unit", comboValue(g_tempUnit, g_tempUnitItems));
 	writeIni("offset_c", textOfAscii(g_offset));
 	writeIni("drift_c_per_min", textOfAscii(g_drift));
+	writeIni("blackbody_target_c", textOfAscii(g_blackbodyTarget));
 	writeIni("filter", comboValue(g_filter, g_levelItems));
 	writeIni("bilateral", comboValue(g_bilateral, g_levelItems));
 	writeIni("temporal", comboValue(g_temporal, g_levelItems));
@@ -645,6 +765,7 @@ static void resetDefaults() {
 	selectComboByValue(g_tempUnit, g_tempUnitItems, "celsius", 0);
 	setText(g_offset, L"0.0");
 	setText(g_drift, L"0.0");
+	setText(g_blackbodyTarget, L"35.0");
 	selectComboByValue(g_filter, g_levelItems, "off", 0);
 	selectComboByValue(g_bilateral, g_levelItems, "off", 0);
 	selectComboByValue(g_temporal, g_levelItems, "off", 0);
@@ -682,6 +803,7 @@ static void loadSettings() {
 	selectComboByValue(g_tempUnit, g_tempUnitItems, readIni("temp_unit", "celsius"), 0);
 	setText(g_offset, widenAscii(readIni("offset_c", "0.0")));
 	setText(g_drift, widenAscii(readIni("drift_c_per_min", "0.0")));
+	setText(g_blackbodyTarget, widenAscii(readIni("blackbody_target_c", "35.0")));
 	selectComboByValue(g_filter, g_levelItems, readIni("filter", "off"), 0);
 	selectComboByValue(g_bilateral, g_levelItems, readIni("bilateral", "off"), 0);
 	selectComboByValue(g_temporal, g_levelItems, readIni("temporal", "off"), 0);
@@ -809,6 +931,11 @@ static void createControls(HWND hwnd) {
 	addLabel(hwnd, L"Drift C/min", L"温漂 C/分钟", labelX, y, labelW, rowH);
 	g_drift = addEdit(hwnd, IDC_DRIFT, controlX, y - 2, 90, rowH);
 	addLabel(hwnd, L"Default 0", L"默认 0", rightX, y, 92, rowH);
+	y += gap;
+
+	addLabel(hwnd, L"Blackbody target C", L"黑体目标 C", labelX, y, labelW, rowH);
+	g_blackbodyTarget = addEdit(hwnd, IDC_BLACKBODY_TARGET, controlX, y - 2, 90, rowH);
+	g_blackbodyCalibrate = addButton(hwnd, IDC_BLACKBODY_CALIBRATE, L"Calibrate", L"黑体校准", rightX, y - 4, 116, 28);
 	y += gap;
 
 	addLabel(hwnd, L"Blur", L"模糊", labelX, y, labelW, rowH);
@@ -1043,6 +1170,42 @@ static void sendLiveCommand(const std::string &command) {
 	}
 }
 
+static void sendBlackbodyCalibration(HWND hwnd) {
+	if ( ! isProcessRunning() ) {
+		setStatus(L"Start the camera before calibration.", L"请先启动相机再校准。");
+		return;
+	}
+	if ( ! looksNumeric(g_blackbodyTarget) ) {
+		setStatus(L"Blackbody target temperature is not numeric.", L"黑体目标温度不是数字。");
+		return;
+	}
+
+	g_suppressEvents = true;
+	selectComboByValue(g_roiMode, g_roiItems, "rect", 2);
+	g_suppressEvents = false;
+	updatePreview();
+	saveSettings();
+
+	std::ostringstream id;
+	id << GetCurrentProcessId() << "-" << GetTickCount64();
+	g_pendingCalibrationId = id.str();
+	g_calibrationPolls = 0;
+
+	std::ostringstream cmd;
+	cmd << "calibrate blackbody "
+	    << textOfAscii(g_blackbodyTarget)
+	    << " " << comboValue(g_roiSize, g_roiSizeItems)
+	    << " " << g_pendingCalibrationId
+	    << "\n";
+	if ( sendControlText(cmd.str()) ) {
+		SetTimer(hwnd, TIMER_CALIBRATION_STATUS, 250, NULL);
+		setStatus(L"Blackbody calibration sent; waiting for result.", L"已发送黑体校准，等待结果。");
+	} else {
+		g_pendingCalibrationId.clear();
+		setStatus(L"Live control pipe is not ready; calibration was not sent.", L"实时控制管道未就绪，校准未发送。");
+	}
+}
+
 static void sendChangedControl(int id) {
 	if ( ! isProcessRunning() ) {
 		return;
@@ -1232,6 +1395,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 				if ( ! isProcessRunning() ) {
 					KillTimer(hwnd, TIMER_PROCESS);
 					KillTimer(hwnd, TIMER_INITIAL_SYNC);
+					KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
+					g_pendingCalibrationId.clear();
 					g_pipeName.clear();
 					updatePreview();
 					setStatus(L"Process exited.", L"进程已退出。");
@@ -1243,6 +1408,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 					KillTimer(hwnd, TIMER_INITIAL_SYNC);
 					setStatus(L"Initial live settings synced.", L"初始实时参数已同步。");
 				}
+				return 0;
+			}
+			if ( wParam == TIMER_CALIBRATION_STATUS ) {
+				pollCalibrationStatus(hwnd);
 				return 0;
 			}
 			return 0;
@@ -1270,6 +1439,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			}
 			if ( id == IDC_RUNTIME_RESET && notify == BN_CLICKED ) {
 				sendLiveCommand("reset");
+				return 0;
+			}
+			if ( id == IDC_BLACKBODY_CALIBRATE && notify == BN_CLICKED ) {
+				sendBlackbodyCalibration(hwnd);
 				return 0;
 			}
 			if ( id == IDC_RESET_DEFAULTS && notify == BN_CLICKED ) {
@@ -1311,6 +1484,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			return 0;
 		}
 		case WM_DESTROY:
+			KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
 			saveSettings();
 			if ( isProcessRunning() ) {
 				if ( ! sendControlText("quit\n") || WAIT_TIMEOUT == WaitForSingleObject(g_process, 1200) ) {
@@ -1370,7 +1544,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR cmdLine, int nCmdShow) 
 
 	HWND hwnd = CreateWindowExW(0, wc.lpszClassName, g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-		CW_USEDEFAULT, CW_USEDEFAULT, 660, 990,
+		CW_USEDEFAULT, CW_USEDEFAULT, 660, 1024,
 		NULL, NULL, hInstance, NULL);
 	if ( ! hwnd ) {
 		return 1;

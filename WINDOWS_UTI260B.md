@@ -123,6 +123,17 @@ Display enhancement controls:
 - `Temp offset C` and `Drift C/min`: displayed-temperature calibration. Offset
   is a fixed correction; drift is a linear Celsius-per-minute correction from
   program start or the last drift change. Both leave RAW data untouched.
+- `Blackbody target C` + `Calibrate`: manual one-point blackbody correction.
+  Cover the lens with a stable isothermal blackbody or uniform-temperature
+  target, wait about 5 seconds for the camera output to settle, enter the
+  target Celsius value, choose the ROI size, then press `Calibrate`. The
+  runtime measures the center rectangle ROI average and adjusts `Temp offset C` by
+  `target - measured_average`. The result is written to
+  `thermal-camera-redux-calibration-status.txt`, and the GUI reads it back to
+  show the measured temperature, applied delta, new offset, and ROI percent.
+  If `Drift C/min` is active, the current drift contribution is folded into the
+  new offset and drift is reset to 0 so the calibrated display does not keep
+  moving after the blackbody reference step.
 - `Manual temp range`: fixed min/max Celsius range for thermal-to-colormap
   mapping. This is display mapping only; temperature calculations still use the
   original thermal matrix.
