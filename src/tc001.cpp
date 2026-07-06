@@ -3573,6 +3573,45 @@ void recording( ProcessedThermalFrame *ptf, int forcedStop ) {
 
 }
 
+static void writeRecordingFrame( ProcessedThermalFrame *ptf, Mat &frame ) {
+	// Active Recording doesn't handle scale/resize/rotate changes, so ...
+	// the active recording gets stopped when these configuration changes happen.
+	if ( ! controls.recording ) {
+		return;
+	}
+
+	try {
+		time_t now          = time(NULL);
+		time_t delta        = now - controls.recordStartTime;
+		struct tm *timeinfo = gmtime (&delta);
+
+		strftime (controls.elapsed, sizeof(controls.elapsed), "%H:%M:%S", timeinfo);
+
+		pthread_mutex_lock( &videoOutMutex );
+			// Protect videoOut and recordingActive
+			if ( controls.recordingActive ) {
+				ptf->videoOut.write( frame );
+			}
+		pthread_mutex_unlock( &videoOutMutex );
+
+		controls.recFrameCounter++;
+
+		if ( 0 == (controls.recFrameCounter % 6) ) {
+// TODO - FIXME - This increment maybe a race condition with the main threads clearing to 0x00
+			// Signal HUD to update at least 4X / second to update elapsed timer
+			threadData.configurationChanged++;
+		}
+
+		// Raw video file grows very quickly, maybe drop a few frames ???
+#if 0 // Disabling this feature until streaming compression is added
+		if ((controls.recFrameCounter % 10) == 0) {
+			rawRecFp = writeRawFrame( rawFrame, rawRecFilename, rawRecFp, 1 );
+		}
+#endif
+	} catch (...) {
+	}
+}
+
 // Adding offline post raw still and raw video processing functionality
 
 void writeRawFrame(Mat &frame, FILE *fp) {
@@ -7262,7 +7301,7 @@ int mainPrivate (int argc, char *argv[]) {
 		}
 
 		// Worker threads should have finished processing sub-frames at this point.
-		// imageDataThread maybe recording the rgbFrame while main thread is showing the rgbFrame
+		// Main owns final overlay/display/recording before releasing workers to the next frame.
 		// thermalDataThread and imageDataThead are then on their way to blocking on state 0
 		// while this main thread is finishing with the current frame and providing the next frame.
 		// Their thread states should be 0, or 3 transitioning to 0
@@ -7350,11 +7389,12 @@ int mainPrivate (int argc, char *argv[]) {
 
 			pthread_mutex_unlock( &videoOutMutex );
 
+			writeRecordingFrame( ptf, borderFrame );
 			imshow( WINDOW_NAME, borderFrame );
 		}
 
 #else
-		// Show the composited frame while imageDataThread maybe recording same composited frame
+		writeRecordingFrame( ptf, rgbFrame );
 		imshow( WINDOW_NAME, rgbFrame );
 #endif
 

@@ -342,6 +342,48 @@ static std::string comboValue(HWND combo, const std::vector<ComboItem> &items) {
 	return items[selected].value;
 }
 
+static bool isPresetOwnedControl(int id) {
+	switch (id) {
+		case IDC_ROTATION:
+		case IDC_SCALE:
+		case IDC_INTERP:
+		case IDC_CMAP:
+		case IDC_OFFSET:
+		case IDC_DRIFT:
+		case IDC_FILTER:
+		case IDC_BILATERAL:
+		case IDC_TEMPORAL:
+		case IDC_SHARPEN:
+		case IDC_FULLSCREEN:
+		case IDC_BLUR:
+		case IDC_THRESHOLD:
+		case IDC_AUTORANGE:
+		case IDC_MAPPING:
+		case IDC_MANUAL_ENABLE:
+		case IDC_MANUAL_MIN:
+		case IDC_MANUAL_MAX:
+		case IDC_ROI_MODE:
+		case IDC_ROI_SIZE:
+		case IDC_ISOTHERM_ENABLE:
+		case IDC_ISOTHERM_THRESHOLD:
+		case IDC_HISTOGRAM:
+		case IDC_RULERS:
+		case IDC_CONTRAST:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static void markPresetCustomForManualChange(int id) {
+	if ( ! isPresetOwnedControl(id) || comboValue(g_preset, g_presetItems) == "custom" ) {
+		return;
+	}
+	g_suppressEvents = true;
+	selectComboByValue(g_preset, g_presetItems, "custom", 0);
+	g_suppressEvents = false;
+}
+
 static void reloadCombo(HWND combo, const std::vector<ComboItem> &items, const std::string &value, int fallbackIndex) {
 	SendMessageW(combo, CB_RESETCONTENT, 0, 0);
 	addComboItems(combo, items);
@@ -931,10 +973,6 @@ static std::string allLiveSettingsCommand() {
 	appendSet(cmd, "histogram", boolValue(g_histogram));
 	appendSet(cmd, "rulers", comboValue(g_rulers, g_rulerItems));
 	appendSet(cmd, "fullscreen", boolValue(g_fullscreen));
-	std::string preset = comboValue(g_preset, g_presetItems);
-	if ( preset != "custom" ) {
-		cmd << "preset " << preset << "\n";
-	}
 	return cmd.str();
 }
 
@@ -1200,6 +1238,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 				return 0;
 			}
 			if ( notify == CBN_SELCHANGE || notify == EN_CHANGE || notify == BN_CLICKED ) {
+				markPresetCustomForManualChange(id);
 				updatePreview();
 				saveSettings();
 				if ( id == IDC_DEVICE ) {
