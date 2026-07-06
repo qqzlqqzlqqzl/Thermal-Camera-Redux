@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <string>
 #include <sstream>
+#include <vector>
 #include <cwctype>
 #include <ctype.h>
 #include <string.h>
@@ -42,6 +43,16 @@ static inline int nice(int) { return 0; }
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/core/mat.hpp>  // Video Frame class
+
+#ifndef USE_DNN_SUPERRES
+#define USE_DNN_SUPERRES 0
+#endif
+
+#if USE_DNN_SUPERRES
+#include <opencv2/dnn.hpp>
+#include <opencv2/dnn_superres.hpp>
+#endif
+
 #include <iostream>
 
 using namespace std;
@@ -1223,6 +1234,41 @@ DisplayLevel DisplayLevels[] = {
 #define MAX_DISPLAY_LEVELS ARRAY_COUNT( DisplayLevels )
 
 typedef enum {
+	AI_SUPERRES_OFF = 0,
+	AI_SUPERRES_FSRCNN_X2,
+	AI_SUPERRES_ESPCN_X2,
+	AI_SUPERRES_MAX
+} AiSuperResMode;
+
+typedef struct {
+	AiSuperResMode mode;
+	const char *name;
+	const char *shortName;
+	const char *modelFile;
+	const char *modelName;
+	int scale;
+} AiSuperResOption;
+
+static AiSuperResOption AiSuperResOptions[] = {
+	{ AI_SUPERRES_OFF,       "Off",           "Off",       "",              "",       1 },
+	{ AI_SUPERRES_FSRCNN_X2, "FSRCNN x2 CPU", "FSRCNNx2",  "FSRCNN_x2.pb",  "fsrcnn", 2 },
+	{ AI_SUPERRES_ESPCN_X2,  "ESPCN x2 CPU",  "ESPCNx2",   "ESPCN_x2.pb",   "espcn",  2 }
+};
+
+#define MAX_AI_SUPERRES ARRAY_COUNT( AiSuperResOptions )
+
+static const AiSuperResOption &aiSuperResOption( int mode ) {
+	if ( mode < 0 || mode >= MAX_AI_SUPERRES ) {
+		return AiSuperResOptions[AI_SUPERRES_OFF];
+	}
+	return AiSuperResOptions[mode];
+}
+
+static const char *aiSuperResName( int mode ) {
+	return aiSuperResOption( mode ).name;
+}
+
+typedef enum {
 	ROI_MODE_OFF = 0,
 	ROI_MODE_SPOT,
 	ROI_MODE_RECT
@@ -1402,6 +1448,7 @@ typedef struct {
 	int bilateralLevel;
 	int temporalDenoiseLevel;
 	int sharpenLevel;
+	int aiSuperResMode;
 	int manualRangeEnabled;
 	float manualRangeMinC;
 	float manualRangeMaxC;
@@ -1594,6 +1641,222 @@ static void applyDisplayEnhancements( Mat &frame ) {
 	}
 
 	applyDisplayTemporalDenoise( frame );
+}
+
+static int aiSuperResLoadedMode = AI_SUPERRES_OFF;
+static int aiSuperResFailedMode = -1;
+static std::string aiSuperResLoadedPath;
+
+#if USE_DNN_SUPERRES
+static cv::dnn_superres::DnnSuperResImpl aiSuperResDnn;
+#endif
+
+static void resetAiSuperResRuntime() {
+	aiSuperResLoadedMode = AI_SUPERRES_OFF;
+	aiSuperResFailedMode = -1;
+	aiSuperResLoadedPath.clear();
+}
+
+static void markAiSuperResFailed( int mode ) {
+	aiSuperResFailedMode = mode;
+	aiSuperResLoadedMode = AI_SUPERRES_OFF;
+	aiSuperResLoadedPath.clear();
+}
+
+static const char *aiSuperResHudStatus() {
+	int mode = controls.aiSuperResMode;
+	if ( AI_SUPERRES_OFF == mode ) {
+		return "Off";
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+	if ( MyScale < option.scale ) {
+		return "Scale<2";
+	}
+	if ( aiSuperResFailedMode == mode ) {
+		return "Fallback";
+	}
+	if ( aiSuperResLoadedMode == mode && ! aiSuperResLoadedPath.empty() ) {
+		return option.shortName;
+	}
+	return option.shortName;
+}
+
+static bool fileExists( const std::string &path ) {
+	return ! path.empty() && 0 == access( path.c_str(), F_OK );
+}
+
+static std::string directoryName( const std::string &path ) {
+	size_t slash = path.find_last_of( "/\\" );
+	if ( slash == std::string::npos ) {
+		return "";
+	}
+	return path.substr( 0, slash );
+}
+
+static std::string joinPath( const std::string &dir, const std::string &name ) {
+	if ( dir.empty() ) {
+		return name;
+	}
+	char last = dir[ dir.size() - 1 ];
+	if ( last == '/' || last == '\\' ) {
+		return dir + name;
+	}
+#ifdef _WIN32
+	return dir + "\\" + name;
+#else
+	return dir + "/" + name;
+#endif
+}
+
+static std::string executableDir() {
+#ifdef _WIN32
+	char path[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameA( NULL, path, MAX_PATH );
+	if ( 0 < length && length < MAX_PATH ) {
+		return directoryName( std::string( path, length ) );
+	}
+#else
+	char path[PATH_MAX] = {0};
+	ssize_t length = readlink( "/proc/self/exe", path, sizeof(path) - 1 );
+	if ( 0 < length ) {
+		path[length] = '\0';
+		return directoryName( std::string( path ) );
+	}
+#endif
+	return directoryName( Argv0 );
+}
+
+static std::vector<std::string> aiSuperResModelCandidates( const AiSuperResOption &option ) {
+	std::vector<std::string> paths;
+	std::string exeDir = executableDir();
+	std::string argvDir = directoryName( Argv0 );
+
+	paths.push_back( joinPath( "models", option.modelFile ) );
+	if ( ! exeDir.empty() ) {
+		paths.push_back( joinPath( joinPath( exeDir, "models" ), option.modelFile ) );
+	}
+	if ( ! argvDir.empty() ) {
+		paths.push_back( joinPath( joinPath( argvDir, "models" ), option.modelFile ) );
+	}
+	return paths;
+}
+
+static bool loadAiSuperResModel( int mode ) {
+	if ( AI_SUPERRES_OFF == mode ) {
+		return false;
+	}
+	if ( aiSuperResFailedMode == mode ) {
+		return false;
+	}
+	if ( aiSuperResLoadedMode == mode && ! aiSuperResLoadedPath.empty() ) {
+		return true;
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+
+#if USE_DNN_SUPERRES
+	std::string modelPath;
+	for ( const std::string &candidate : aiSuperResModelCandidates( option ) ) {
+		if ( fileExists( candidate ) ) {
+			modelPath = candidate;
+			break;
+		}
+	}
+
+	if ( modelPath.empty() ) {
+		printf("AI super-resolution model %s not found under models/; falling back to %s interpolation\n",
+			option.modelFile, Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+
+	try {
+		aiSuperResDnn.readModel( modelPath );
+		aiSuperResDnn.setModel( option.modelName, option.scale );
+		aiSuperResDnn.setPreferableBackend( cv::dnn::DNN_BACKEND_OPENCV );
+		aiSuperResDnn.setPreferableTarget( cv::dnn::DNN_TARGET_CPU );
+		aiSuperResLoadedMode = mode;
+		aiSuperResLoadedPath = modelPath;
+		aiSuperResFailedMode = -1;
+		printf("AI super-resolution enabled: %s, model %s, CPU backend\n",
+			option.name, modelPath.c_str());
+		return true;
+	} catch ( const cv::Exception &e ) {
+		printf("AI super-resolution failed to initialize %s from %s: %s; falling back to %s interpolation\n",
+			option.name, modelPath.c_str(), e.what(), Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+#else
+	printf("AI super-resolution %s requested, but this build has no OpenCV dnn_superres support; falling back to %s interpolation\n",
+		option.name, Inters[controls.inters].name);
+	markAiSuperResFailed( mode );
+	return false;
+#endif
+}
+
+static bool applyAiSuperResolution( const Mat &src, Mat &dst, const Size &targetSize ) {
+	int mode = controls.aiSuperResMode;
+	if ( AI_SUPERRES_OFF == mode || src.empty() ) {
+		return false;
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+	if ( targetSize.width < (src.cols * option.scale) ||
+	     targetSize.height < (src.rows * option.scale) ) {
+		return false;
+	}
+
+	if ( ! loadAiSuperResModel( mode ) ) {
+		return false;
+	}
+
+#if USE_DNN_SUPERRES
+	try {
+		Mat input;
+		if ( CV_8U == src.depth() && ( 1 == src.channels() || 3 == src.channels() ) ) {
+			input = src;
+		} else if ( CV_8U == src.depth() && 4 == src.channels() ) {
+			cvtColor( src, input, COLOR_BGRA2BGR );
+		} else {
+			src.convertTo( input, CV_8U );
+		}
+
+		Mat upscaled;
+		// Paper-aligned placement: LR display-intensity frame in, model x2 out;
+		// pseudo-color, HUD, ROI, and recording composition stay downstream.
+		aiSuperResDnn.upsample( input, upscaled );
+		if ( upscaled.empty() ) {
+			printf("AI super-resolution inference returned an empty frame for %s; falling back to %s interpolation\n",
+				aiSuperResName( mode ), Inters[controls.inters].name);
+			markAiSuperResFailed( mode );
+			return false;
+		}
+
+		if ( upscaled.cols == targetSize.width && upscaled.rows == targetSize.height ) {
+			upscaled.copyTo( dst );
+		} else {
+			int inter = ( targetSize.width < upscaled.cols || targetSize.height < upscaled.rows ) ?
+				INTER_AREA : Inters[controls.inters].inter;
+			resize( upscaled, dst, targetSize, 0.0, 0.0, inter );
+		}
+		return true;
+	} catch ( const cv::Exception &e ) {
+		printf("AI super-resolution inference failed for %s: %s; falling back to %s interpolation\n",
+			aiSuperResName( mode ), e.what(), Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+#else
+	return false;
+#endif
+}
+
+static void upscaleDisplaySource( const Mat &src, Mat &dst, const Size &targetSize ) {
+	if ( ! applyAiSuperResolution( src, dst, targetSize ) ) {
+		resize( src, dst, targetSize, 0.0, 0.0, Inters[controls.inters].inter );
+	}
 }
 
 // Optimization: Remove if's from rendering routines by using function pointer
@@ -2279,6 +2542,7 @@ void resetDefaults() {
 	controls.bilateralLevel       = 0;
 	controls.temporalDenoiseLevel = 0;
 	controls.sharpenLevel         = 0;
+	controls.aiSuperResMode       = AI_SUPERRES_OFF;
 	controls.manualRangeEnabled   = 0;
 	controls.manualRangeMinC      = 20.0f;
 	controls.manualRangeMaxC      = 45.0f;
@@ -2287,6 +2551,7 @@ void resetDefaults() {
 	controls.isothermEnabled      = 0;
 	controls.isothermThresholdC   = 60.0f;
 	resetDisplayTemporalDenoise();
+	resetAiSuperResRuntime();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
 	strcpy(controls.snaptime, "None");
@@ -3829,6 +4094,7 @@ void printUsage() {
   printf( "                 [-celsius] [-fahrenheit]\n");
   printf( "                 [-temp-offset-c n] [-temp-offset-f n] [-temp-drift-c-per-min n]\n");
   printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
+  printf( "                 [-ai-superres off|fsrcnn2|espcn2] CPU DNN x2 display super-resolution\n");
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
   printf( "                 [-control-pipe name] for live Windows GUI controls\n");
@@ -3892,8 +4158,9 @@ void printInfo() {
   printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C, display rotation %d\n",
 	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius,
 	  RotateDisplay * 90);
-  printf("    display super-resolution %dx %s, filter %s, bilateral %s, temporal %s, sharpen %s\n",
+  printf("    display super-resolution %dx %s, AI %s, filter %s, bilateral %s, temporal %s, sharpen %s\n",
 	  MyScale, Inters[controls.inters].name,
+	  aiSuperResName(controls.aiSuperResMode),
 	  displayLevelName(controls.displayFilterPreset),
 	  displayLevelName(controls.bilateralLevel),
 	  displayLevelName(controls.temporalDenoiseLevel),
@@ -4481,7 +4748,9 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, L_X, Y(2) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
-	sprintf(buf, "SR:%dx %s Blur:%d", MyScale, Inters[controls.inters].name, controls.rad);
+	sprintf(buf, "SR:%dx %s AI:%s B:%d",
+		MyScale, Inters[controls.inters].name,
+		aiSuperResHudStatus(), controls.rad);
 	POINT( hudPoint, L_X, Y(3) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
@@ -6089,6 +6358,32 @@ static int parseDisplayLevel( const char *value ) {
 	return -1;
 }
 
+static int parseAiSuperResMode( const char *value ) {
+	if ( ! value ) {
+		return -1;
+	}
+	if ( strEqualsIgnoreCase( value, "off" ) ||
+	     strEqualsIgnoreCase( value, "none" ) ||
+	     strEqualsIgnoreCase( value, "0" ) ) {
+		return AI_SUPERRES_OFF;
+	}
+	if ( strEqualsIgnoreCase( value, "fsrcnn" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn2" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn-x2" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn_x2" ) ||
+	     strEqualsIgnoreCase( value, "1" ) ) {
+		return AI_SUPERRES_FSRCNN_X2;
+	}
+	if ( strEqualsIgnoreCase( value, "espcn" ) ||
+	     strEqualsIgnoreCase( value, "espcn2" ) ||
+	     strEqualsIgnoreCase( value, "espcn-x2" ) ||
+	     strEqualsIgnoreCase( value, "espcn_x2" ) ||
+	     strEqualsIgnoreCase( value, "2" ) ) {
+		return AI_SUPERRES_ESPCN_X2;
+	}
+	return -1;
+}
+
 static int parseInterpolationIndex( const char *value ) {
 	if ( isIntegerString( value ) ) {
 		int index = atoi( value );
@@ -6180,6 +6475,18 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 				return -1;
 			}
 			controls.inters = index;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-ai-superres") ||
+			     ! strcmp( argv[i], "-ai-sr") ||
+			     ! strcmp( argv[i], "-superres-ai")) && hasNext ) {
+			int mode = parseAiSuperResMode( argv[ i + 1 ] );
+			if ( mode < 0 ) {
+				printf("%sUnknown AI super-resolution mode '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.aiSuperResMode = mode;
+			resetAiSuperResRuntime();
 			threadData.configurationChanged++;
 			i++;
 		} else if (( ! strcmp( argv[i], "-blur") ||
@@ -6404,6 +6711,19 @@ static void setRuntimeDisplayLevel( int &target, const std::string &value ) {
 	}
 }
 
+static void setRuntimeAiSuperResMode( const std::string &value ) {
+	int mode = parseAiSuperResMode( value.c_str() );
+	if ( mode < 0 ) {
+		return;
+	}
+	if ( controls.aiSuperResMode != mode ) {
+		controls.aiSuperResMode = mode;
+		resetAiSuperResRuntime();
+		resetDisplayTemporalDenoise();
+		threadData.configurationChanged++;
+	}
+}
+
 static void setRuntimeMappingFilter( int value ) {
 	if ( value < 0 ) {
 		value = 0;
@@ -6473,6 +6793,18 @@ static void setRuntimeRulerMode( ProcessedThermalFrame *ptf, int value ) {
 
 static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &name ) {
 	std::string preset = lowerControlString( name );
+	bool knownPreset = preset == "raw" ||
+	                   preset == "pcb" ||
+	                   preset == "hvac" ||
+	                   preset == "human" ||
+	                   preset == "low-noise" ||
+	                   preset == "low_noise" ||
+	                   preset == "high-contrast" ||
+	                   preset == "high_contrast";
+	if ( knownPreset ) {
+		controls.aiSuperResMode = AI_SUPERRES_OFF;
+		resetAiSuperResRuntime();
+	}
 	if ( preset == "raw" ) {
 		controls.alpha = 1.0;
 		controls.cmapCurrent = 0;
@@ -6591,6 +6923,8 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 			controls.inters = index;
 			threadData.configurationChanged++;
 		}
+	} else if ( key == "ai-superres" || key == "ai-sr" || key == "superres-ai" || key == "aisr" ) {
+		setRuntimeAiSuperResMode( lowerValue );
 	} else if ( key == "cmap" || key == "colormap" ) {
 		controls.cmapCurrent = abs( atoi( value.c_str() ) ) % MAX_CMAPS;
 		threadData.configurationChanged++;

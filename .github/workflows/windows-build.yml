@@ -30,13 +30,16 @@ jobs:
       - name: Build minimal OpenCV
         run: |
           set -euxo pipefail
-          curl -L --retry 5 -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"
+          curl -fL --retry 5 --retry-all-errors -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"
+          curl -fL --retry 5 --retry-all-errors -o opencv_contrib.zip "https://github.com/opencv/opencv_contrib/archive/refs/tags/${OPENCV_VERSION}.zip"
           unzip -q opencv.zip
+          unzip -q opencv_contrib.zip
           cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/opencv-install" \
             -DBUILD_SHARED_LIBS=ON \
-            -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio \
+            -DOPENCV_EXTRA_MODULES_PATH="$PWD/opencv_contrib-${OPENCV_VERSION}/modules" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio,dnn,dnn_superres \
             -DOPENCV_GENERATE_PKGCONFIG=OFF \
             -DBUILD_opencv_apps=OFF \
             -DBUILD_TESTS=OFF \
@@ -44,7 +47,7 @@ jobs:
             -DBUILD_EXAMPLES=OFF \
             -DBUILD_DOCS=OFF \
             -DBUILD_JAVA=OFF \
-            -DBUILD_PROTOBUF=OFF \
+            -DBUILD_PROTOBUF=ON \
             -DBUILD_opencv_python2=OFF \
             -DBUILD_opencv_python3=OFF \
             -DWITH_QT=OFF \
@@ -62,7 +65,7 @@ jobs:
             -DWITH_LAPACK=OFF \
             -DWITH_IPP=OFF \
             -DWITH_ITT=OFF \
-            -DWITH_PROTOBUF=OFF \
+            -DWITH_PROTOBUF=ON \
             -DWITH_JPEG=ON \
             -DWITH_PNG=ON \
             -DWITH_TIFF=OFF \
@@ -92,9 +95,9 @@ jobs:
           export PATH="$OPENCV_BIN_DIR:$PATH"
           OPENCV_LIB_SUFFIX="$(printf '%s' "$OPENCV_VERSION" | awk -F. '{ printf "%d%d%d", $1, $2, $3 }')"
           OPENCV_CFLAGS="-I$OPENCV_PREFIX/include"
-          OPENCV_LIBS="-L$OPENCV_LIB_DIR -lopencv_highgui${OPENCV_LIB_SUFFIX} -lopencv_videoio${OPENCV_LIB_SUFFIX} -lopencv_imgcodecs${OPENCV_LIB_SUFFIX} -lopencv_imgproc${OPENCV_LIB_SUFFIX} -lopencv_core${OPENCV_LIB_SUFFIX}"
+          OPENCV_LIBS="-L$OPENCV_LIB_DIR -lopencv_dnn_superres${OPENCV_LIB_SUFFIX} -lopencv_dnn${OPENCV_LIB_SUFFIX} -lopencv_highgui${OPENCV_LIB_SUFFIX} -lopencv_videoio${OPENCV_LIB_SUFFIX} -lopencv_imgcodecs${OPENCV_LIB_SUFFIX} -lopencv_imgproc${OPENCV_LIB_SUFFIX} -lopencv_core${OPENCV_LIB_SUFFIX}"
           WINDOWS_LIBS="-lmf -lmfreadwrite -lmfplat -lmfuuid -lole32 -loleaut32"
-          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 tc001.cpp thread.cpp -o redux.exe -lpthread ${OPENCV_CFLAGS} ${OPENCV_LIBS} ${WINDOWS_LIBS}
+          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 -DUSE_DNN_SUPERRES=1 tc001.cpp thread.cpp -o redux.exe -lpthread ${OPENCV_CFLAGS} ${OPENCV_LIBS} ${WINDOWS_LIBS}
           g++ -std=c++17 -Wall -Wextra -O2 ${CFLAGS} launcher_win32.cpp -o Thermal-Camera-Redux-GUI.exe -mwindows -lcomctl32
           ldd redux.exe | tee ../redux-ldd.txt
           ! grep "not found" ../redux-ldd.txt | grep -vi "api-ms-win-crt-"
@@ -108,6 +111,38 @@ jobs:
           cp Thermal-Camera-Redux-GUI.exe ../dist/windows-x64/
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
           cp ../WINDOWS_UTI260B.md ../dist/windows-x64/
+          mkdir -p ../dist/windows-x64/models
+          download_model() {
+            local url="$1"
+            local out="$2"
+            local sha256="$3"
+            curl -fL --retry 5 --retry-all-errors -o "$out" "$url"
+            echo "${sha256}  ${out}" | sha256sum -c -
+          }
+          download_model \
+            "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x2.pb" \
+            "../dist/windows-x64/models/FSRCNN_x2.pb" \
+            "366b33f0084c7b3f2bf6724f0a2c77bca94fcec9d7b6d72389d330073b380d5c"
+          download_model \
+            "https://raw.githubusercontent.com/fannymonori/TF-ESPCN/master/export/ESPCN_x2.pb" \
+            "../dist/windows-x64/models/ESPCN_x2.pb" \
+            "59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d"
+          test "$(stat -c%s ../dist/windows-x64/models/FSRCNN_x2.pb)" -gt 30000
+          test "$(stat -c%s ../dist/windows-x64/models/ESPCN_x2.pb)" -gt 80000
+          cat > ../dist/windows-x64/models/AI_SUPERRES_MODELS.txt <<'EOF'
+          FSRCNN_x2.pb:
+            Source: https://github.com/Saafke/FSRCNN_Tensorflow
+            License: Apache-2.0
+            SHA256: 366b33f0084c7b3f2bf6724f0a2c77bca94fcec9d7b6d72389d330073b380d5c
+            FSRCNN paper flow: LR image -> feature extraction -> shrinking -> nonlinear mapping -> expanding -> deconvolution x2.
+            Packaged model note: this OpenCV-compatible TensorFlow export uses sub-pixel upsampling in place of the original FSRCNN deconvolution layer.
+
+          ESPCN_x2.pb:
+            Source: https://github.com/fannymonori/TF-ESPCN
+            License: Apache-2.0
+            SHA256: 59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d
+            Paper flow followed by this runtime: LR image -> LR-space convolution -> sub-pixel convolution / pixel shuffle x2.
+          EOF
           OPENCV_BIN="$PWD/../opencv-install/x64/mingw/bin"
           if [ ! -d "$OPENCV_BIN" ]; then
             OPENCV_BIN="$PWD/../opencv-install/bin"
@@ -141,6 +176,22 @@ jobs:
           find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
             copy_mingw_deps "$plugin"
           done
+          if find ../dist/windows-x64 -type f \( -iname '*.a' -o -iname '*.h' -o -iname '*.hpp' -o -iname '*.pc' \) | grep -q .; then
+            echo "Runtime package contains development files"
+            find ../dist/windows-x64 -type f \( -iname '*.a' -o -iname '*.h' -o -iname '*.hpp' -o -iname '*.pc' \)
+            exit 1
+          fi
+          if find ../dist/windows-x64 -type d \( -iname include -o -iname pkgconfig -o -path '*/var/cache/pacman*' \) | grep -q .; then
+            echo "Runtime package contains SDK/cache directories"
+            find ../dist/windows-x64 -type d \( -iname include -o -iname pkgconfig -o -path '*/var/cache/pacman*' \)
+            exit 1
+          fi
+          runtime_bytes="$(du -sb ../dist/windows-x64 | awk '{ print $1 }')"
+          max_runtime_bytes=$((250 * 1024 * 1024))
+          if [ "$runtime_bytes" -gt "$max_runtime_bytes" ]; then
+            echo "Runtime package is too large: ${runtime_bytes} bytes"
+            exit 1
+          fi
           du -sh ../dist/windows-x64
           find ../dist/windows-x64 -maxdepth 2 -type f -printf '%P\n' | sort
 
@@ -164,6 +215,15 @@ jobs:
             throw 'GUI dry-run did not write thermal-camera-redux-last-command.txt'
           }
           Get-Content .\thermal-camera-redux-last-command.txt
+          if (-not (Select-String -LiteralPath .\thermal-camera-redux-last-command.txt -Pattern '-ai-superres' -Quiet)) {
+            throw 'GUI dry-run command did not include -ai-superres'
+          }
+          if (-not (Select-String -LiteralPath .\thermal-camera-redux-last-command.txt -SimpleMatch '-ai-superres "off"' -Quiet)) {
+            throw 'GUI dry-run command did not default AI super-resolution to off'
+          }
+          if (-not (Test-Path .\models\FSRCNN_x2.pb) -or -not (Test-Path .\models\ESPCN_x2.pb)) {
+            throw 'AI super-resolution models are missing from packaged runtime'
+          }
           if (-not $acceptedHelpExit) {
             $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
             if (Test-Path $toolchainBin) {

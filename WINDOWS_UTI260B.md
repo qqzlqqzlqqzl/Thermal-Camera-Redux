@@ -10,12 +10,17 @@ used by `USB\VID_0BDA&PID_3901`.
   development libraries to run the packaged build.
 - The uploaded artifact is intended to be the distributable runtime folder:
   `Thermal-Camera-Redux.exe`, `Thermal-Camera-Redux-GUI.exe`, only the
-  required runtime DLLs, and `run_uti260b_windows.cmd`.
+  required runtime DLLs, `models/`, and `run_uti260b_windows.cmd`.
 - Do not redistribute the full OpenCV SDK, headers, import libraries, or MSYS2
   package cache with the runtime folder.
 - The Windows CI build compiles a minimal OpenCV with Win32 UI and DirectShow
-  enabled, while Qt, FFmpeg, GStreamer, OpenCL, tests, docs, Python, Java, and
-  examples are disabled to keep the runtime small.
+  enabled, plus OpenCV DNN/dnn_superres for CPU AI super-resolution. Qt,
+  FFmpeg, GStreamer, OpenCL, tests, docs, Python, Java, and examples are
+  disabled to keep the runtime small.
+- AI super-resolution models are downloaded by GitHub Actions into
+  `models/`: `FSRCNN_x2.pb` from Saafke/FSRCNN_Tensorflow and `ESPCN_x2.pb`
+  from fannymonori/TF-ESPCN. Both upstream model repositories are Apache-2.0.
+  CI pins these files by SHA256 before packaging them.
 - UTi260B capture on Windows uses the app's Media Foundation raw YUY2 path,
   because OpenCV/DirectShow can expose this device as converted RGB and corrupt
   the thermal matrix.
@@ -72,6 +77,8 @@ run_uti260b_windows.cmd 0 -fahrenheit
 run_uti260b_windows.cmd 0 -temp-offset-c -3.5
 run_uti260b_windows.cmd 0 -temp-offset-f -6.3
 run_uti260b_windows.cmd 0 -display-scale 4 -interp lanczos
+run_uti260b_windows.cmd 0 -display-scale 4 -ai-superres fsrcnn2
+run_uti260b_windows.cmd 0 -display-scale 4 -ai-superres espcn2
 run_uti260b_windows.cmd 0 -filter-preset medium -bilateral low -temporal-denoise low -sharpen medium
 ```
 
@@ -86,6 +93,19 @@ Display enhancement controls:
   maximum scale.
 - `Interpolation`: classic software super-resolution/display upscale method.
   Supported GUI choices are Nearest, Bilinear, Bicubic, and Lanczos.
+- `AI super-res`: CPU-only x2 neural upscaling for the realtime display path.
+  Supported modes are Off, FSRCNN x2 CPU realtime, and ESPCN x2 CPU realtime.
+  The integration follows the paper-level processing flow instead of stacking
+  arbitrary filters: FSRCNN receives the low-resolution display-intensity image
+  and performs feature extraction, shrinking, nonlinear mapping, expanding, and
+  upsampling. The original FSRCNN paper uses deconvolution for the final x2
+  stage; the packaged Saafke TensorFlow export is OpenCV-compatible and uses a
+  sub-pixel upsampling layer in that position. ESPCN performs convolution in
+  low-resolution space and upsamples through sub-pixel convolution/pixel
+  shuffle x2. The model output is then resized further by the selected classic
+  interpolation if the GUI display scale is greater than 2x. If OpenCV DNN is
+  unavailable, a model file is missing, or inference fails, the program falls
+  back to the selected classic interpolation and logs the reason.
 - `Colormap`: pseudo-color palettes are labeled with readable names such as
   Jet rainbow heat, Hot iron red, Turbo high contrast, Bone gray-white, and
   Deep green. The numeric index is kept in parentheses only for reproducible
@@ -120,7 +140,9 @@ Display enhancement controls:
 These enhancement controls only affect the rendered display frame before the
 HUD/markers are drawn. Temperature readings, min/max/avg, center temperature,
 rulers, ROI statistics, and `.raw` snapshots continue to use the original
-`256x192` thermal matrix.
+`256x192` thermal matrix. AI super-resolution is also display-only: it never
+rewrites `rawFrame` or `thermalFrame` and does not create new measured
+temperature samples.
 
 The GUI live-control transport is started with:
 

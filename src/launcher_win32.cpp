@@ -60,6 +60,7 @@ static const int IDC_RULERS = 1033;
 static const int IDC_DRIFT = 1034;
 static const int IDC_CONTRAST = 1035;
 static const int IDC_TEMP_UNIT = 1036;
+static const int IDC_AI_SUPERRES = 1037;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -69,6 +70,7 @@ static HWND g_language;
 static HWND g_device;
 static HWND g_rotation;
 static HWND g_scale;
+static HWND g_aiSuperres;
 static HWND g_interp;
 static HWND g_cmap;
 static HWND g_tempUnit;
@@ -143,6 +145,12 @@ static std::vector<ComboItem> g_interpItems = {
 	{ L"Bilinear", L"双线性", "linear" },
 	{ L"Bicubic", L"双三次", "cubic" },
 	{ L"Lanczos4", L"Lanczos4", "lanczos" }
+};
+
+static std::vector<ComboItem> g_aiSuperresItems = {
+	{ L"Off", L"关闭", "off" },
+	{ L"FSRCNN x2 CPU realtime", L"FSRCNN x2 CPU 实时", "fsrcnn2" },
+	{ L"ESPCN x2 CPU realtime", L"ESPCN x2 CPU 实时", "espcn2" }
 };
 
 static std::vector<ComboItem> g_levelItems = {
@@ -353,6 +361,7 @@ static bool isPresetOwnedControl(int id) {
 	switch (id) {
 		case IDC_ROTATION:
 		case IDC_SCALE:
+		case IDC_AI_SUPERRES:
 		case IDC_INTERP:
 		case IDC_CMAP:
 		case IDC_TEMP_UNIT:
@@ -479,6 +488,7 @@ static std::wstring buildCommandLineFromValues(
 	const std::string &deviceValue,
 	const std::string &rotationValue,
 	const std::string &scaleValue,
+	const std::string &aiSuperresValue,
 	const std::string &interpValue,
 	const std::string &cmapValue,
 	const std::string &tempUnitValue,
@@ -502,6 +512,7 @@ static std::wstring buildCommandLineFromValues(
 	    << L" -d " << quoteArgW(device)
 	    << L" -rotate " << quoteArgW(widenAscii(rotationValue))
 	    << L" -display-scale " << quoteArgW(widenAscii(scaleValue))
+	    << L" -ai-superres " << quoteArgW(widenAscii(aiSuperresValue))
 	    << L" -interp " << quoteArgW(widenAscii(interpValue))
 	    << L" -cmap " << quoteArgW(widenAscii(cmapValue))
 	    << (tempUnitValue == "fahrenheit" ? L" -fahrenheit" : L" -celsius")
@@ -524,6 +535,7 @@ static std::wstring buildCommandLine() {
 		textOfAscii(g_device),
 		comboValue(g_rotation, g_rotationItems),
 		comboValue(g_scale, g_scaleItems),
+		comboValue(g_aiSuperres, g_aiSuperresItems),
 		comboValue(g_interp, g_interpItems),
 		selectedCmapValue(),
 		comboValue(g_tempUnit, g_tempUnitItems),
@@ -564,6 +576,7 @@ static void saveSettings() {
 	writeIni("device", textOfAscii(g_device));
 	writeIni("rotation", comboValue(g_rotation, g_rotationItems));
 	writeIni("scale", comboValue(g_scale, g_scaleItems));
+	writeIni("ai_superres", comboValue(g_aiSuperres, g_aiSuperresItems));
 	writeIni("interp", comboValue(g_interp, g_interpItems));
 	writeIni("cmap", selectedCmapValue());
 	writeIni("temp_unit", comboValue(g_tempUnit, g_tempUnitItems));
@@ -601,6 +614,7 @@ static void applyLanguageToUi() {
 	reloadCombo(g_language, g_languageItems, g_zh ? "zh-CN" : "en-US", g_zh ? 0 : 1);
 	reloadCombo(g_rotation, g_rotationItems, comboValue(g_rotation, g_rotationItems), 1);
 	reloadCombo(g_scale, g_scaleItems, comboValue(g_scale, g_scaleItems), 3);
+	reloadCombo(g_aiSuperres, g_aiSuperresItems, comboValue(g_aiSuperres, g_aiSuperresItems), 0);
 	reloadCombo(g_interp, g_interpItems, comboValue(g_interp, g_interpItems), 2);
 	reloadCmapCombo(selectedCmapValue());
 	reloadCombo(g_tempUnit, g_tempUnitItems, comboValue(g_tempUnit, g_tempUnitItems), 0);
@@ -625,6 +639,7 @@ static void resetDefaults() {
 	setText(g_device, L"0");
 	selectComboByValue(g_rotation, g_rotationItems, "90", 1);
 	selectComboByValue(g_scale, g_scaleItems, "4", 3);
+	selectComboByValue(g_aiSuperres, g_aiSuperresItems, "off", 0);
 	selectComboByValue(g_interp, g_interpItems, "lanczos", 3);
 	reloadCmapCombo("4");
 	selectComboByValue(g_tempUnit, g_tempUnitItems, "celsius", 0);
@@ -661,6 +676,7 @@ static void loadSettings() {
 	setText(g_device, widenAscii(readIni("device", "0")));
 	selectComboByValue(g_rotation, g_rotationItems, readIni("rotation", "90"), 1);
 	selectComboByValue(g_scale, g_scaleItems, readIni("scale", "4"), 3);
+	selectComboByValue(g_aiSuperres, g_aiSuperresItems, readIni("ai_superres", "off"), 0);
 	selectComboByValue(g_interp, g_interpItems, readIni("interp", "lanczos"), 3);
 	reloadCmapCombo(readIni("cmap", "4"));
 	selectComboByValue(g_tempUnit, g_tempUnitItems, readIni("temp_unit", "celsius"), 0);
@@ -739,7 +755,7 @@ static void createControls(HWND hwnd) {
 	int rightX = 398;
 	int rightW = 220;
 	int rowH = 23;
-	int gap = 29;
+	int gap = 27;
 
 	addLabel(hwnd, L"Language", L"语言", labelX, y, labelW, rowH);
 	g_language = addCombo(hwnd, IDC_LANGUAGE, controlX, y - 2, controlW, 160);
@@ -764,6 +780,11 @@ static void createControls(HWND hwnd) {
 	addLabel(hwnd, L"Super-res scale", L"软件超分倍率", labelX, y, labelW, rowH);
 	g_scale = addCombo(hwnd, IDC_SCALE, controlX, y - 2, controlW, 180);
 	addComboItems(g_scale, g_scaleItems);
+	y += gap;
+
+	addLabel(hwnd, L"AI super-res", L"AI 超分", labelX, y, labelW, rowH);
+	g_aiSuperres = addCombo(hwnd, IDC_AI_SUPERRES, controlX, y - 2, controlW + 88, 180);
+	addComboItems(g_aiSuperres, g_aiSuperresItems);
 	y += gap;
 
 	addLabel(hwnd, L"Interpolation", L"插值算法", labelX, y, labelW, rowH);
@@ -983,6 +1004,7 @@ static std::string allLiveSettingsCommand() {
 	std::ostringstream cmd;
 	appendSet(cmd, "rotation", comboValue(g_rotation, g_rotationItems));
 	appendSet(cmd, "scale", comboValue(g_scale, g_scaleItems));
+	appendSet(cmd, "ai-superres", comboValue(g_aiSuperres, g_aiSuperresItems));
 	appendSet(cmd, "interp", comboValue(g_interp, g_interpItems));
 	appendSet(cmd, "cmap", selectedCmapValue());
 	appendSet(cmd, "temp-unit", comboValue(g_tempUnit, g_tempUnitItems));
@@ -1028,6 +1050,7 @@ static void sendChangedControl(int id) {
 	switch (id) {
 		case IDC_ROTATION: sendLiveCommand("set rotation " + comboValue(g_rotation, g_rotationItems)); break;
 		case IDC_SCALE: sendLiveCommand("set scale " + comboValue(g_scale, g_scaleItems)); break;
+		case IDC_AI_SUPERRES: sendLiveCommand("set ai-superres " + comboValue(g_aiSuperres, g_aiSuperresItems)); break;
 		case IDC_INTERP: sendLiveCommand("set interp " + comboValue(g_interp, g_interpItems)); break;
 		case IDC_CMAP: sendLiveCommand("set cmap " + selectedCmapValue()); break;
 		case IDC_TEMP_UNIT: sendLiveCommand("set temp-unit " + comboValue(g_tempUnit, g_tempUnitItems)); break;
@@ -1068,6 +1091,9 @@ static void sendChangedControl(int id) {
 
 static void applyPresetToGui(const std::string &preset) {
 	g_suppressEvents = true;
+	if ( preset != "custom" ) {
+		selectComboByValue(g_aiSuperres, g_aiSuperresItems, "off", 0);
+	}
 	if ( preset == "raw" ) {
 		reloadCmapCombo("0");
 		selectComboByValue(g_blur, g_blurItems, "0", 0);
@@ -1301,7 +1327,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static int dryRun() {
 	std::wstring commandLine = buildCommandLineFromValues(
-		"0", "90", "4", "lanczos", "4", "celsius", "0.0", "0.0",
+		"0", "90", "4", "off", "lanczos", "4", "celsius", "0.0", "0.0",
 		"off", "off", "off", "off", false, "dry-run-pipe");
 	writeLastCommand(commandLine);
 	if ( commandLine.find(L"Thermal-Camera-Redux.exe") == std::wstring::npos ) {
@@ -1312,6 +1338,12 @@ static int dryRun() {
 	}
 	if ( commandLine.find(L"-celsius") == std::wstring::npos ) {
 		return 3;
+	}
+	if ( commandLine.find(L"-ai-superres") == std::wstring::npos ) {
+		return 4;
+	}
+	if ( commandLine.find(L"-ai-superres \"off\"") == std::wstring::npos ) {
+		return 5;
 	}
 	return 0;
 }

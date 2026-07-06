@@ -44,11 +44,22 @@
 
 			// Optimization: Cornercase for 1X scale.  Interpolation of 1:1 pixels does not make sense
 			if ( 1 < MyScale ) {
-				SIZE( size, controls.sW, controls.sH );
-				resize(*sourcePtr, *threadData.rgbFrameOrig, size,
-                       	              0.0, 0.0, // optional 0.0, 0.0 args is REQUIRED for Interpolation options to work
-                                     Inters[controls.inters].inter // INTER_CUBIC default
-                                ); // Scale up from native camera resolution
+				if ( WINDOW_DOUBLE_WIDE == controls.windowFormat ||
+				     WINDOW_DOUBLE_HIGH == controls.windowFormat ) {
+					Mat scaledImageFrame;
+					Mat scaledThermalFrame;
+					SIZE( paneSize, controls.scaledSFWidth, controls.scaledSFHeight );
+					upscaleDisplaySource( rgbImageFrame, scaledImageFrame, paneSize );
+					upscaleDisplaySource( rgbThermalFrame, scaledThermalFrame, paneSize );
+					if ( WINDOW_DOUBLE_WIDE == controls.windowFormat ) {
+						cv::hconcat( scaledImageFrame, scaledThermalFrame, *threadData.rgbFrameOrig );
+					} else {
+						cv::vconcat( scaledImageFrame, scaledThermalFrame, *threadData.rgbFrameOrig );
+					}
+				} else {
+					SIZE( size, controls.sW, controls.sH );
+					upscaleDisplaySource( *sourcePtr, *threadData.rgbFrameOrig, size );
+				}
 				useFrameOrig = 1;
 			}
 
