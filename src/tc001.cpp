@@ -1423,6 +1423,8 @@ typedef struct {
 	int64_t startMills;
 	double fps;
 	time_t recordStartTime; // Seconds time(null)
+	int recordingWidth;
+	int recordingHeight;
 	HUDFormat hud;          // HUDFormats
 	bool wD;		// WindowDouble if DOUBLE_WIDTH or DOUBLE_HIGH
 	bool useCelsius;
@@ -2284,6 +2286,8 @@ void resetDefaults() {
 	controls.roiRectPercent       = 25;
 	controls.isothermEnabled      = 0;
 	controls.isothermThresholdC   = 60.0f;
+	controls.recordingWidth       = 0;
+	controls.recordingHeight      = 0;
 	resetDisplayTemporalDenoise();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
@@ -3515,19 +3519,32 @@ VideoWriter rec() {
 	// int codec = VideoWriter::fourcc('X', 'V', 'I', 'D');  // select desired codec (must be available at runtime)
 
 	// https://docs.opencv.org/4.5.1/df/d94/samples_2cpp_2videowriter_basic_8cpp-example.html#a9
-	VideoWriter videoOut(filename, VideoWriter::fourcc('X', 'V', 'I','D'), 
-			NATIVE_FPS, 
+	int recordWidth  = controls.sW;
+	int recordHeight = controls.sH;
 #if BORDER_LAYOUT
-			Size(controls.sW, controls.sH)
-			// TODO - FIXME - VideoWriter doesn't like odd sizes
-			//Size(borderFrame.cols, borderFrame.rows)
-#else
-			Size(controls.sW, controls.sH)
+	if ( ! borderFrame.empty() ) {
+		recordWidth  = borderFrame.cols;
+		recordHeight = borderFrame.rows;
+	} else {
+		recordWidth = leftBorderWidth + controls.sW + rightBorderWidth;
+	}
 #endif
+	if ( recordWidth & 1 )  recordWidth--;
+	if ( recordHeight & 1 ) recordHeight--;
+	if ( recordWidth <= 0 )  recordWidth  = controls.sW;
+	if ( recordHeight <= 0 ) recordHeight = controls.sH;
+	controls.recordingWidth  = recordWidth;
+	controls.recordingHeight = recordHeight;
+
+	VideoWriter videoOut(filename, VideoWriter::fourcc('X', 'V', 'I','D'),
+			NATIVE_FPS,
+			Size(controls.recordingWidth, controls.recordingHeight)
 			);
 
 #if BORDER_LAYOUT
-			printf("cols %d, rows %d\n", borderFrame.cols, borderFrame.rows);
+			printf("cols %d, rows %d, recording cols %d, rows %d\n",
+				borderFrame.cols, borderFrame.rows,
+				controls.recordingWidth, controls.recordingHeight);
 #endif
 
 	return videoOut;
@@ -3561,6 +3578,7 @@ void recording( ProcessedThermalFrame *ptf, int forcedStop ) {
 					strcpy(controls.elapsed,"00:00:00");
 					ptf->videoOut.release();
 					ptf->videoOut.~VideoWriter();
+					controls.recordingWidth = controls.recordingHeight = 0;
 
 					if ( rawRecFp ) {
 						fclose( rawRecFp );
@@ -3590,7 +3608,16 @@ static void writeRecordingFrame( ProcessedThermalFrame *ptf, Mat &frame ) {
 		pthread_mutex_lock( &videoOutMutex );
 			// Protect videoOut and recordingActive
 			if ( controls.recordingActive ) {
-				ptf->videoOut.write( frame );
+				Mat frameOut = frame;
+				if ( controls.recordingWidth > 0 && controls.recordingHeight > 0 &&
+				     ( frame.cols != controls.recordingWidth || frame.rows != controls.recordingHeight ) ) {
+					if ( frame.cols >= controls.recordingWidth && frame.rows >= controls.recordingHeight ) {
+						frameOut = frame( Rect( 0, 0, controls.recordingWidth, controls.recordingHeight ) );
+					}
+				}
+				if ( frameOut.cols == controls.recordingWidth && frameOut.rows == controls.recordingHeight ) {
+					ptf->videoOut.write( frameOut );
+				}
 			}
 		pthread_mutex_unlock( &videoOutMutex );
 
