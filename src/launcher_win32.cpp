@@ -57,6 +57,8 @@ static const int IDC_ISOTHERM_ENABLE = 1030;
 static const int IDC_ISOTHERM_THRESHOLD = 1031;
 static const int IDC_HISTOGRAM = 1032;
 static const int IDC_RULERS = 1033;
+static const int IDC_DRIFT = 1034;
+static const int IDC_CONTRAST = 1035;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -69,6 +71,7 @@ static HWND g_scale;
 static HWND g_interp;
 static HWND g_cmap;
 static HWND g_offset;
+static HWND g_drift;
 static HWND g_filter;
 static HWND g_bilateral;
 static HWND g_temporal;
@@ -84,6 +87,7 @@ static HWND g_runtimeReset;
 static HWND g_resetDefaults;
 static HWND g_preset;
 static HWND g_blur;
+static HWND g_contrast;
 static HWND g_threshold;
 static HWND g_autorange;
 static HWND g_mapping;
@@ -104,6 +108,7 @@ static std::vector<std::wstring> g_cmapLabelsEn;
 static std::vector<std::wstring> g_cmapLabelsZh;
 static std::vector<std::string> g_cmapValues;
 static HANDLE g_process = NULL;
+static HANDLE g_pipe = INVALID_HANDLE_VALUE;
 static DWORD g_processId = 0;
 static std::string g_pipeName;
 
@@ -145,6 +150,13 @@ static std::vector<ComboItem> g_blurItems = {
 	{ L"Low", L"低", "2" },
 	{ L"Medium", L"中", "4" },
 	{ L"Strong", L"强", "6" }
+};
+
+static std::vector<ComboItem> g_contrastItems = {
+	{ L"1.00 normal", L"1.00 正常", "1.0" },
+	{ L"1.15 mild", L"1.15 轻微", "1.15" },
+	{ L"1.35 high", L"1.35 高", "1.35" },
+	{ L"1.60 strong", L"1.60 强", "1.60" }
 };
 
 static std::vector<ComboItem> g_autorangeItems = {
@@ -409,6 +421,7 @@ static std::wstring buildCommandLineFromValues(
 	const std::string &interpValue,
 	const std::string &cmapValue,
 	const std::string &offsetValue,
+	const std::string &driftValue,
 	const std::string &filterValue,
 	const std::string &bilateralValue,
 	const std::string &temporalValue,
@@ -419,6 +432,7 @@ static std::wstring buildCommandLineFromValues(
 	std::wstring exe = joinPathW(dir, L"Thermal-Camera-Redux.exe");
 	std::wstring device = widenAscii(deviceValue.empty() ? "0" : deviceValue);
 	std::wstring offset = widenAscii(offsetValue.empty() ? "0.0" : offsetValue);
+	std::wstring drift = widenAscii(driftValue.empty() ? "0.0" : driftValue);
 
 	std::wostringstream cmd;
 	cmd << quoteArgW(exe)
@@ -429,6 +443,7 @@ static std::wstring buildCommandLineFromValues(
 	    << L" -interp " << quoteArgW(widenAscii(interpValue))
 	    << L" -cmap " << quoteArgW(widenAscii(cmapValue))
 	    << L" -temp-offset-c " << quoteArgW(offset)
+	    << L" -temp-drift-c-per-min " << quoteArgW(drift)
 	    << L" -filter-preset " << quoteArgW(widenAscii(filterValue))
 	    << L" -bilateral " << quoteArgW(widenAscii(bilateralValue))
 	    << L" -temporal-denoise " << quoteArgW(widenAscii(temporalValue))
@@ -449,6 +464,7 @@ static std::wstring buildCommandLine() {
 		comboValue(g_interp, g_interpItems),
 		selectedCmapValue(),
 		textOfAscii(g_offset),
+		textOfAscii(g_drift),
 		comboValue(g_filter, g_levelItems),
 		comboValue(g_bilateral, g_levelItems),
 		comboValue(g_temporal, g_levelItems),
@@ -487,6 +503,7 @@ static void saveSettings() {
 	writeIni("interp", comboValue(g_interp, g_interpItems));
 	writeIni("cmap", selectedCmapValue());
 	writeIni("offset_c", textOfAscii(g_offset));
+	writeIni("drift_c_per_min", textOfAscii(g_drift));
 	writeIni("filter", comboValue(g_filter, g_levelItems));
 	writeIni("bilateral", comboValue(g_bilateral, g_levelItems));
 	writeIni("temporal", comboValue(g_temporal, g_levelItems));
@@ -494,6 +511,7 @@ static void saveSettings() {
 	writeIni("fullscreen", boolValue(g_fullscreen));
 	writeIni("preset", comboValue(g_preset, g_presetItems));
 	writeIni("blur", comboValue(g_blur, g_blurItems));
+	writeIni("contrast", comboValue(g_contrast, g_contrastItems));
 	writeIni("threshold_c", textOfAscii(g_threshold));
 	writeIni("autorange", comboValue(g_autorange, g_autorangeItems));
 	writeIni("mapping", comboValue(g_mapping, g_mappingItems));
@@ -526,6 +544,7 @@ static void applyLanguageToUi() {
 	reloadCombo(g_sharpen, g_levelItems, comboValue(g_sharpen, g_levelItems), 0);
 	reloadCombo(g_preset, g_presetItems, comboValue(g_preset, g_presetItems), 0);
 	reloadCombo(g_blur, g_blurItems, comboValue(g_blur, g_blurItems), 0);
+	reloadCombo(g_contrast, g_contrastItems, comboValue(g_contrast, g_contrastItems), 0);
 	reloadCombo(g_autorange, g_autorangeItems, comboValue(g_autorange, g_autorangeItems), 0);
 	reloadCombo(g_mapping, g_mappingItems, comboValue(g_mapping, g_mappingItems), 0);
 	reloadCombo(g_roiMode, g_roiItems, comboValue(g_roiMode, g_roiItems), 0);
@@ -543,6 +562,7 @@ static void resetDefaults() {
 	selectComboByValue(g_interp, g_interpItems, "lanczos", 3);
 	reloadCmapCombo("4");
 	setText(g_offset, L"0.0");
+	setText(g_drift, L"0.0");
 	selectComboByValue(g_filter, g_levelItems, "off", 0);
 	selectComboByValue(g_bilateral, g_levelItems, "off", 0);
 	selectComboByValue(g_temporal, g_levelItems, "off", 0);
@@ -550,6 +570,7 @@ static void resetDefaults() {
 	setChecked(g_fullscreen, false);
 	selectComboByValue(g_preset, g_presetItems, "custom", 0);
 	selectComboByValue(g_blur, g_blurItems, "0", 0);
+	selectComboByValue(g_contrast, g_contrastItems, "1.0", 0);
 	setText(g_threshold, L"2.0");
 	selectComboByValue(g_autorange, g_autorangeItems, "0", 0);
 	selectComboByValue(g_mapping, g_mappingItems, "1", 0);
@@ -576,6 +597,7 @@ static void loadSettings() {
 	selectComboByValue(g_interp, g_interpItems, readIni("interp", "lanczos"), 3);
 	reloadCmapCombo(readIni("cmap", "4"));
 	setText(g_offset, widenAscii(readIni("offset_c", "0.0")));
+	setText(g_drift, widenAscii(readIni("drift_c_per_min", "0.0")));
 	selectComboByValue(g_filter, g_levelItems, readIni("filter", "off"), 0);
 	selectComboByValue(g_bilateral, g_levelItems, readIni("bilateral", "off"), 0);
 	selectComboByValue(g_temporal, g_levelItems, readIni("temporal", "off"), 0);
@@ -583,6 +605,7 @@ static void loadSettings() {
 	setChecked(g_fullscreen, readIni("fullscreen", "0") == "1");
 	selectComboByValue(g_preset, g_presetItems, readIni("preset", "custom"), 0);
 	selectComboByValue(g_blur, g_blurItems, readIni("blur", "0"), 0);
+	selectComboByValue(g_contrast, g_contrastItems, readIni("contrast", "1.0"), 0);
 	setText(g_threshold, widenAscii(readIni("threshold_c", "2.0")));
 	selectComboByValue(g_autorange, g_autorangeItems, readIni("autorange", "0"), 0);
 	selectComboByValue(g_mapping, g_mappingItems, readIni("mapping", "1"), 0);
@@ -689,9 +712,19 @@ static void createControls(HWND hwnd) {
 	g_offset = addEdit(hwnd, IDC_OFFSET, controlX, y - 2, 90, rowH);
 	y += gap;
 
+	addLabel(hwnd, L"Drift C/min", L"温漂 C/分钟", labelX, y, labelW, rowH);
+	g_drift = addEdit(hwnd, IDC_DRIFT, controlX, y - 2, 90, rowH);
+	addLabel(hwnd, L"Default 0", L"默认 0", rightX, y, 92, rowH);
+	y += gap;
+
 	addLabel(hwnd, L"Blur", L"模糊", labelX, y, labelW, rowH);
 	g_blur = addCombo(hwnd, IDC_BLUR, controlX, y - 2, controlW, 180);
 	addComboItems(g_blur, g_blurItems);
+	y += gap;
+
+	addLabel(hwnd, L"Contrast / gain", L"对比/增益", labelX, y, labelW, rowH);
+	g_contrast = addCombo(hwnd, IDC_CONTRAST, controlX, y - 2, controlW, 180);
+	addComboItems(g_contrast, g_contrastItems);
 	y += gap;
 
 	addLabel(hwnd, L"Gaussian filter", L"高斯滤波", labelX, y, labelW, rowH);
@@ -786,48 +819,79 @@ static std::string generatePipeName() {
 	return pipe.str();
 }
 
+static void closeControlPipe() {
+	if ( INVALID_HANDLE_VALUE != g_pipe ) {
+		CloseHandle(g_pipe);
+		g_pipe = INVALID_HANDLE_VALUE;
+	}
+}
+
 static bool isProcessRunning() {
 	if ( ! g_process ) {
 		return false;
 	}
 	DWORD code = 0;
-	if ( ! GetExitCodeProcess(g_process, &code) ) {
-		CloseHandle(g_process);
-		g_process = NULL;
-		g_processId = 0;
-		return false;
+		if ( ! GetExitCodeProcess(g_process, &code) ) {
+			closeControlPipe();
+			CloseHandle(g_process);
+			g_process = NULL;
+			g_processId = 0;
+			return false;
 	}
 	if ( STILL_ACTIVE == code ) {
 		return true;
 	}
+	closeControlPipe();
 	CloseHandle(g_process);
 	g_process = NULL;
 	g_processId = 0;
 	return false;
 }
 
-static bool sendControlText(const std::string &text) {
+static bool ensureControlPipeOpen() {
 	if ( ! isProcessRunning() || g_pipeName.empty() ) {
 		return false;
 	}
+	if ( INVALID_HANDLE_VALUE != g_pipe ) {
+		return true;
+	}
 	std::string pipePath = "\\\\.\\pipe\\" + g_pipeName;
-	HANDLE pipe = INVALID_HANDLE_VALUE;
 	for (int attempt = 0; attempt < 8; attempt++) {
-		pipe = CreateFileA(pipePath.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-		if ( INVALID_HANDLE_VALUE != pipe ) {
-			break;
+		g_pipe = CreateFileA(pipePath.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+		if ( INVALID_HANDLE_VALUE != g_pipe ) {
+			return true;
 		}
 		WaitNamedPipeA(pipePath.c_str(), 200);
 		Sleep(60);
 	}
-	if ( INVALID_HANDLE_VALUE == pipe ) {
-		setStatus(L"Live control pipe is not ready yet.", L"实时控制管道暂未就绪。");
+	setStatus(L"Live control pipe is not ready yet.", L"实时控制管道暂未就绪。");
+	return false;
+}
+
+static bool sendControlText(const std::string &text) {
+	if ( ! ensureControlPipeOpen() ) {
 		return false;
 	}
 	DWORD written = 0;
-	BOOL ok = WriteFile(pipe, text.data(), (DWORD)text.size(), &written, NULL);
-	CloseHandle(pipe);
+	BOOL ok = WriteFile(g_pipe, text.data(), (DWORD)text.size(), &written, NULL);
+	if ( ! ok || written != text.size() ) {
+		closeControlPipe();
+		return false;
+	}
 	return ok && written == text.size();
+}
+
+static void terminateCameraProcess() {
+	if ( g_process ) {
+		TerminateProcess(g_process, 0);
+		WaitForSingleObject(g_process, 1500);
+		closeControlPipe();
+		CloseHandle(g_process);
+		g_process = NULL;
+		g_processId = 0;
+		g_pipeName.clear();
+		updatePreview();
+	}
 }
 
 static void appendSet(std::ostringstream &cmd, const char *key, const std::string &value) {
@@ -849,7 +913,9 @@ static std::string allLiveSettingsCommand() {
 	appendSet(cmd, "interp", comboValue(g_interp, g_interpItems));
 	appendSet(cmd, "cmap", selectedCmapValue());
 	appendSet(cmd, "offset-c", textOfAscii(g_offset));
+	appendSet(cmd, "drift-c-per-min", textOfAscii(g_drift));
 	appendSet(cmd, "blur", comboValue(g_blur, g_blurItems));
+	appendSet(cmd, "contrast", comboValue(g_contrast, g_contrastItems));
 	appendSet(cmd, "filter", comboValue(g_filter, g_levelItems));
 	appendSet(cmd, "bilateral", comboValue(g_bilateral, g_levelItems));
 	appendSet(cmd, "temporal", comboValue(g_temporal, g_levelItems));
@@ -865,6 +931,10 @@ static std::string allLiveSettingsCommand() {
 	appendSet(cmd, "histogram", boolValue(g_histogram));
 	appendSet(cmd, "rulers", comboValue(g_rulers, g_rulerItems));
 	appendSet(cmd, "fullscreen", boolValue(g_fullscreen));
+	std::string preset = comboValue(g_preset, g_presetItems);
+	if ( preset != "custom" ) {
+		cmd << "preset " << preset << "\n";
+	}
 	return cmd.str();
 }
 
@@ -893,7 +963,11 @@ static void sendChangedControl(int id) {
 		case IDC_OFFSET:
 			if ( looksNumeric(g_offset) ) sendLiveCommand("set offset-c " + textOfAscii(g_offset));
 			break;
+		case IDC_DRIFT:
+			if ( looksNumeric(g_drift) ) sendLiveCommand("set drift-c-per-min " + textOfAscii(g_drift));
+			break;
 		case IDC_BLUR: sendLiveCommand("set blur " + comboValue(g_blur, g_blurItems)); break;
+		case IDC_CONTRAST: sendLiveCommand("set contrast " + comboValue(g_contrast, g_contrastItems)); break;
 		case IDC_FILTER: sendLiveCommand("set filter " + comboValue(g_filter, g_levelItems)); break;
 		case IDC_BILATERAL: sendLiveCommand("set bilateral " + comboValue(g_bilateral, g_levelItems)); break;
 		case IDC_TEMPORAL: sendLiveCommand("set temporal " + comboValue(g_temporal, g_levelItems)); break;
@@ -930,6 +1004,7 @@ static void applyPresetToGui(const std::string &preset) {
 		selectComboByValue(g_bilateral, g_levelItems, "off", 0);
 		selectComboByValue(g_temporal, g_levelItems, "off", 0);
 		selectComboByValue(g_sharpen, g_levelItems, "off", 0);
+		selectComboByValue(g_contrast, g_contrastItems, "1.0", 0);
 		setChecked(g_isothermEnable, false);
 		setChecked(g_manualEnable, false);
 	} else if ( preset == "pcb" ) {
@@ -940,6 +1015,7 @@ static void applyPresetToGui(const std::string &preset) {
 		selectComboByValue(g_bilateral, g_levelItems, "low", 1);
 		selectComboByValue(g_temporal, g_levelItems, "low", 1);
 		selectComboByValue(g_sharpen, g_levelItems, "medium", 2);
+		selectComboByValue(g_contrast, g_contrastItems, "1.15", 1);
 		setChecked(g_isothermEnable, true);
 		setText(g_isothermThreshold, L"55.0");
 	} else if ( preset == "hvac" ) {
@@ -950,6 +1026,7 @@ static void applyPresetToGui(const std::string &preset) {
 		selectComboByValue(g_bilateral, g_levelItems, "low", 1);
 		selectComboByValue(g_temporal, g_levelItems, "low", 1);
 		selectComboByValue(g_sharpen, g_levelItems, "low", 1);
+		selectComboByValue(g_contrast, g_contrastItems, "1.15", 1);
 		setChecked(g_isothermEnable, true);
 		setText(g_isothermThreshold, L"35.0");
 	} else if ( preset == "human" ) {
@@ -960,6 +1037,7 @@ static void applyPresetToGui(const std::string &preset) {
 		selectComboByValue(g_bilateral, g_levelItems, "low", 1);
 		selectComboByValue(g_temporal, g_levelItems, "medium", 2);
 		selectComboByValue(g_sharpen, g_levelItems, "low", 1);
+		selectComboByValue(g_contrast, g_contrastItems, "1.0", 0);
 		setChecked(g_manualEnable, true);
 		setText(g_manualMin, L"20.0");
 		setText(g_manualMax, L"42.0");
@@ -968,11 +1046,13 @@ static void applyPresetToGui(const std::string &preset) {
 		selectComboByValue(g_bilateral, g_levelItems, "medium", 2);
 		selectComboByValue(g_temporal, g_levelItems, "medium", 2);
 		selectComboByValue(g_sharpen, g_levelItems, "low", 1);
+		selectComboByValue(g_contrast, g_contrastItems, "1.0", 0);
 	} else if ( preset == "high-contrast" ) {
 		selectComboByValue(g_filter, g_levelItems, "off", 0);
 		selectComboByValue(g_bilateral, g_levelItems, "off", 0);
 		selectComboByValue(g_temporal, g_levelItems, "off", 0);
 		selectComboByValue(g_sharpen, g_levelItems, "medium", 2);
+		selectComboByValue(g_contrast, g_contrastItems, "1.35", 2);
 	}
 	g_suppressEvents = false;
 	updatePreview();
@@ -994,6 +1074,7 @@ static void launchCamera(HWND hwnd) {
 		return;
 	}
 
+	closeControlPipe();
 	g_pipeName = generatePipeName();
 	std::wstring commandLine = buildCommandLine();
 	writeLastCommand(commandLine);
@@ -1028,8 +1109,19 @@ static void stopCamera() {
 		setStatus(L"Not running.", L"未运行。");
 		return;
 	}
-	sendControlText("quit\n");
-	setStatus(L"Stop command sent.", L"已发送停止命令。");
+	if ( sendControlText("quit\n") ) {
+		if ( WAIT_TIMEOUT == WaitForSingleObject(g_process, 1500) ) {
+			setStatus(L"Stop command sent; waiting for exit.", L"已发送停止命令，等待退出。");
+		} else {
+			isProcessRunning();
+			g_pipeName.clear();
+			updatePreview();
+			setStatus(L"Process exited.", L"进程已退出。");
+		}
+	} else {
+		terminateCameraProcess();
+		setStatus(L"Pipe unavailable; process was terminated.", L"管道不可用，已终止进程。");
+	}
 }
 
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1123,8 +1215,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 		case WM_DESTROY:
 			saveSettings();
 			if ( isProcessRunning() ) {
-				sendControlText("quit\n");
+				if ( ! sendControlText("quit\n") || WAIT_TIMEOUT == WaitForSingleObject(g_process, 1200) ) {
+					terminateCameraProcess();
+				}
 			}
+			closeControlPipe();
 			PostQuitMessage(0);
 			return 0;
 		default:
@@ -1134,7 +1229,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static int dryRun() {
 	std::wstring commandLine = buildCommandLineFromValues(
-		"0", "90", "4", "lanczos", "4", "0.0",
+		"0", "90", "4", "lanczos", "4", "0.0", "0.0",
 		"off", "off", "off", "off", false, "dry-run-pipe");
 	writeLastCommand(commandLine);
 	if ( commandLine.find(L"Thermal-Camera-Redux.exe") == std::wstring::npos ) {
@@ -1168,7 +1263,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR cmdLine, int nCmdShow) 
 
 	HWND hwnd = CreateWindowExW(0, wc.lpszClassName, g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-		CW_USEDEFAULT, CW_USEDEFAULT, 660, 780,
+		CW_USEDEFAULT, CW_USEDEFAULT, 660, 960,
 		NULL, NULL, hInstance, NULL);
 	if ( ! hwnd ) {
 		return 1;

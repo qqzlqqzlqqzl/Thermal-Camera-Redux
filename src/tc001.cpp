@@ -315,6 +315,8 @@ static int cameraCaptureRows = RAW_TC_ROWS;
 static int cameraHasImageFrame = 1;
 static float kelvinScale = 64.0;
 static float temperatureOffsetCelsius = 0.0;
+static float temperatureDriftCelsiusPerMinute = 0.0;
+static int64_t temperatureDriftStartMillis = 0;
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -1276,11 +1278,21 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 #else
 
 float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius );
+	float driftCelsius = 0.0f;
+	if ( 0 != temperatureDriftStartMillis && 0.0f != temperatureDriftCelsiusPerMinute ) {
+		driftCelsius = (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
+			temperatureDriftCelsiusPerMinute;
+	}
+	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius + driftCelsius );
 }
 
 static unsigned short displayedCelsiusToKelvin(float celsius) {
-	float rawCelsius = celsius - temperatureOffsetCelsius;
+	float driftCelsius = 0.0f;
+	if ( 0 != temperatureDriftStartMillis && 0.0f != temperatureDriftCelsiusPerMinute ) {
+		driftCelsius = (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
+			temperatureDriftCelsiusPerMinute;
+	}
+	float rawCelsius = celsius - temperatureOffsetCelsius - driftCelsius;
 	float kelvin = (rawCelsius + 273.15f) * kelvinScale;
 	if ( kelvin < 0.0f ) {
 		kelvin = 0.0f;
@@ -3743,7 +3755,7 @@ void printUsage() {
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
   printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
-  printf( "                 [-temp-offset-c n] [-temp-offset-f n]\n");
+  printf( "                 [-temp-offset-c n] [-temp-offset-f n] [-temp-drift-c-per-min n]\n");
   printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
@@ -4429,8 +4441,9 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, L_X, Y(7) ); 
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, *ptf->rColor, 1, hudLineType);
 
-	if ( 0.0 != temperatureOffsetCelsius ) {
-		sprintf(buf, "FPS: %.1f  %s Off:%+.1f C", controls.fps, controls.labelWF, temperatureOffsetCelsius);
+	if ( 0.0 != temperatureOffsetCelsius || 0.0f != temperatureDriftCelsiusPerMinute ) {
+		sprintf(buf, "FPS: %.1f  %s Off:%+.1f D:%+.2f", controls.fps, controls.labelWF,
+			temperatureOffsetCelsius, temperatureDriftCelsiusPerMinute);
 	} else {
 		sprintf(buf, "FPS: %.1f  %s", controls.fps, controls.labelWF);
 	}
@@ -4439,9 +4452,17 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 }
 
 static Rect displayPaneRect( Mat &frame ) {
-	int width = min( controls.scaledSFWidth, frame.cols );
-	int height = min( controls.scaledSFHeight, frame.rows );
-	return Rect( 0, 0, max(width, 1), max(height, 1) );
+	int x = (WINDOW_DOUBLE_WIDE == controls.windowFormat) ? controls.scaledSFWidth : 0;
+	int y = (WINDOW_DOUBLE_HIGH == controls.windowFormat) ? controls.scaledSFHeight : 0;
+	if ( x >= frame.cols ) {
+		x = 0;
+	}
+	if ( y >= frame.rows ) {
+		y = 0;
+	}
+	int width = min( controls.scaledSFWidth, frame.cols - x );
+	int height = min( controls.scaledSFHeight, frame.rows - y );
+	return Rect( x, y, max(width, 1), max(height, 1) );
 }
 
 static void drawOverlayText( Mat &frame, const char *text, Point loc, Scalar color ) {
@@ -6158,6 +6179,12 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			temperatureOffsetCelsius = atof( argv[ i + 1 ] ) * 5.0 / 9.0;
 			threadData.configurationChanged++;
 			i++;
+		} else if (( ! strcmp( argv[i], "-temp-drift-c-per-min") ||
+			     ! strcmp( argv[i], "-drift-c-per-min"     )) && hasNext ) {
+			temperatureDriftCelsiusPerMinute = (float)atof( argv[ i + 1 ] );
+			temperatureDriftStartMillis = currentTimeMillis();
+			threadData.configurationChanged++;
+			i++;
 		} else if ( ! strcmp( argv[i], "-clip") && hasNext ) {
 			rulerBoundFlag = abs( atoi( argv[ i + 1 ] ) ) % BOUND_MAX_MOD;
 			i++;
@@ -6369,6 +6396,7 @@ static void setRuntimeRulerMode( ProcessedThermalFrame *ptf, int value ) {
 static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &name ) {
 	std::string preset = lowerControlString( name );
 	if ( preset == "raw" ) {
+		controls.alpha = 1.0;
 		controls.cmapCurrent = 0;
 		controls.rad = 0;
 		controls.displayFilterPreset = 0;
@@ -6378,6 +6406,7 @@ static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &nam
 		controls.isothermEnabled = 0;
 		controls.manualRangeEnabled = 0;
 	} else if ( preset == "pcb" ) {
+		controls.alpha = 1.15;
 		setRuntimeScale( ptf, 4 );
 		controls.inters = parseInterpolationIndex( "lanczos" );
 		controls.cmapCurrent = min( 27, MAX_CMAPS - 1 );
@@ -6388,6 +6417,7 @@ static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &nam
 		controls.isothermEnabled = 1;
 		controls.isothermThresholdC = 55.0f;
 	} else if ( preset == "hvac" ) {
+		controls.alpha = 1.15;
 		setRuntimeScale( ptf, 4 );
 		controls.inters = parseInterpolationIndex( "lanczos" );
 		controls.cmapCurrent = 4;
@@ -6398,6 +6428,7 @@ static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &nam
 		controls.isothermEnabled = 1;
 		controls.isothermThresholdC = 35.0f;
 	} else if ( preset == "human" ) {
+		controls.alpha = 1.0;
 		setRuntimeScale( ptf, 4 );
 		controls.inters = parseInterpolationIndex( "cubic" );
 		controls.cmapCurrent = 17 < MAX_CMAPS ? 17 : 4;
@@ -6407,6 +6438,7 @@ static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &nam
 		controls.sharpenLevel = 1;
 		setRuntimeManualRange( true, 20.0f, 42.0f );
 	} else if ( preset == "low-noise" || preset == "low_noise" ) {
+		controls.alpha = 1.0;
 		controls.displayFilterPreset = 2;
 		controls.bilateralLevel = 2;
 		controls.temporalDenoiseLevel = 2;
@@ -6488,8 +6520,21 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 		temperatureOffsetCelsius = (float)atof( value.c_str() );
 		resetAutoRangeExtrema();
 		threadData.configurationChanged++;
+	} else if ( key == "drift" || key == "temp-drift-c-per-min" || key == "drift-c-per-min" ) {
+		temperatureDriftCelsiusPerMinute = (float)atof( value.c_str() );
+		temperatureDriftStartMillis = currentTimeMillis();
+		resetAutoRangeExtrema();
+		threadData.configurationChanged++;
 	} else if ( key == "blur" || key == "box-blur" ) {
 		controls.rad = max( 0, atoi( value.c_str() ) );
+		threadData.configurationChanged++;
+	} else if ( key == "contrast" || key == "alpha" || key == "gain" ) {
+		controls.alpha = atof( value.c_str() );
+		if ( controls.alpha < 0.0 ) {
+			controls.alpha = 0.0;
+		} else if ( controls.alpha > MAX_ALPHA ) {
+			controls.alpha = MAX_ALPHA;
+		}
 		threadData.configurationChanged++;
 	} else if ( key == "filter" || key == "filter-preset" || key == "display-filter" ) {
 		setRuntimeDisplayLevel( controls.displayFilterPreset, lowerValue );
@@ -6599,6 +6644,9 @@ static void pollRuntimeControlPipe( ProcessedThermalFrame *ptf, Mat *frame ) {
 		if ( connected || ERROR_PIPE_CONNECTED == err ) {
 			controlPipeConnected = true;
 		} else if ( ERROR_PIPE_LISTENING == err || ERROR_NO_DATA == err ) {
+			if ( ERROR_NO_DATA == err ) {
+				DisconnectNamedPipe( controlPipe );
+			}
 			return;
 		} else {
 			DisconnectNamedPipe( controlPipe );
@@ -6620,7 +6668,10 @@ static void pollRuntimeControlPipe( ProcessedThermalFrame *ptf, Mat *frame ) {
 	}
 
 	DWORD err = GetLastError();
-	if ( ERROR_BROKEN_PIPE == err || ERROR_NO_DATA == err ) {
+	if ( ERROR_NO_DATA == err ) {
+		return;
+	}
+	if ( ERROR_BROKEN_PIPE == err ) {
 		if ( ! controlPipeBuffer.empty() ) {
 			applyRuntimeControl( controlPipeBuffer, ptf, frame );
 			controlPipeBuffer.clear();
@@ -6738,6 +6789,7 @@ int mainPrivate (int argc, char *argv[]) {
 	int64_t startup1 = currentTimeMicros();
 
 	setDefaults( ptf );
+	temperatureDriftStartMillis = currentTimeMillis();
 
 	// (code that uses SSE4.2, AVX/AVX2, and other instructions on the platforms that support it)
 	cv::setUseOptimized( true ); // Make sure hardware optimization is enabled
@@ -7220,7 +7272,9 @@ int mainPrivate (int argc, char *argv[]) {
 			TS( int64_t imshowMicros = currentTimeMicros(); )
 
 			if ( HUD_ONLY_VIDEO != controls.hud ) {
+				pthread_mutex_lock( &videoOutMutex );
 				drawAnalysisOverlays( *threadData.rgbFrame, ptf );
+				pthread_mutex_unlock( &videoOutMutex );
 			}
 
 	#if BORDER_LAYOUT

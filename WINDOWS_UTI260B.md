@@ -89,6 +89,11 @@ Display enhancement controls:
 - `Temporal denoise`: display-only frame blending, Off/Low/Medium/Strong.
 - `Sharpen`: display-only unsharp-mask sharpening, Off/Low/Medium/Strong.
 - `Blur`: classic display blur/smoothing, Off/Low/Medium/Strong.
+- `Contrast / gain`: display contrast multiplier using the original Redux
+  contrast path.
+- `Temp offset C` and `Drift C/min`: displayed-temperature calibration. Offset
+  is a fixed correction; drift is a linear Celsius-per-minute correction from
+  program start or the last drift change. Both leave RAW data untouched.
 - `Manual temp range`: fixed min/max Celsius range for thermal-to-colormap
   mapping. This is display mapping only; temperature calculations still use the
   original thermal matrix.

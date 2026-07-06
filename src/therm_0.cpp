@@ -73,12 +73,12 @@
 						thermalToImagePixel( thermalFrame, copy );
 #endif
 					}
-				}
+					}
 
-				if ( Use_Histogram ) {
-					Mat *histogramSource = ( lockAutoRanging || ! cameraHasImageFrame ) ? &copy : &thermalFrame;
-					histogramWrapper( *histogramSource, copy, 1 );
-				}
+					if ( Use_Histogram ) {
+						Mat *histogramSource = ( controls.manualRangeEnabled || lockAutoRanging || ! cameraHasImageFrame ) ? &copy : &thermalFrame;
+						histogramWrapper( *histogramSource, copy, 1 );
+					}
 
                                 thermalFramePtr = &copy;
                         } else {
