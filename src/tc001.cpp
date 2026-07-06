@@ -13,6 +13,7 @@
 #include <chrono>
 #include <algorithm>
 #include <string>
+#include <sstream>
 #include <cwctype>
 #include <ctype.h>
 #include <string.h>
@@ -257,6 +258,7 @@ static int takeSnapshot     = 0;
 static int takeRecording    = 0;
 const char *snapshotPrefix  = "";
 const char *recordingPrefix = "";
+static std::string controlPipeName;
 
 // AlphaNumeric or '-' or '_', NOT starting with '-'
 int validatePrefix( const char *prefix ) {
@@ -836,6 +838,19 @@ static unsigned short	globalImgMax_CLUT = 0;  	// 0 to 255
 static unsigned short	frameImgMin  = USHRT_MAX;
 static unsigned short	frameImgMax  = 0;
 
+static void resetAutoRangeExtrema() {
+	globalKelvinMin = USHRT_MAX;
+	globalKelvinMax = 0;
+	globalKelvinRange = 0;
+	globalImgMin = USHRT_MAX;
+	globalImgMax = 0;
+	globalImgRange = 0;
+	globalImgMin_CLUT = USHRT_MAX;
+	globalImgMax_CLUT = 0;
+	frameImgMin = USHRT_MAX;
+	frameImgMax = 0;
+}
+
 static int leftDragOff = 1; // Track left mouse buttion drag
 
 #define DECODE_ROTATION(value)	(  0 <= (value) && (value) <  90) ? 0 : \
@@ -1206,6 +1221,12 @@ DisplayLevel DisplayLevels[] = {
 #define MAX_DISPLAY_LEVELS ARRAY_COUNT( DisplayLevels )
 
 typedef enum {
+	ROI_MODE_OFF = 0,
+	ROI_MODE_SPOT,
+	ROI_MODE_RECT
+} RoiMode;
+
+typedef enum {
 	ACTIVE_OFF = 0,
 	ACTIVE_ON,
 	ACTIVE_ARROW,
@@ -1256,6 +1277,18 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 
 float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
 	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius );
+}
+
+static unsigned short displayedCelsiusToKelvin(float celsius) {
+	float rawCelsius = celsius - temperatureOffsetCelsius;
+	float kelvin = (rawCelsius + 273.15f) * kelvinScale;
+	if ( kelvin < 0.0f ) {
+		kelvin = 0.0f;
+	}
+	if ( kelvin > (float)USHRT_MAX ) {
+		kelvin = (float)USHRT_MAX;
+	}
+	return (unsigned short)round(kelvin);
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
@@ -1357,6 +1390,13 @@ typedef struct {
 	int bilateralLevel;
 	int temporalDenoiseLevel;
 	int sharpenLevel;
+	int manualRangeEnabled;
+	float manualRangeMinC;
+	float manualRangeMaxC;
+	int roiMode;
+	int roiRectPercent;
+	int isothermEnabled;
+	float isothermThresholdC;
 
 	int sW;			// scaled Width  of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
 	int sH;			// scaled Height of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
@@ -2225,6 +2265,13 @@ void resetDefaults() {
 	controls.bilateralLevel       = 0;
 	controls.temporalDenoiseLevel = 0;
 	controls.sharpenLevel         = 0;
+	controls.manualRangeEnabled   = 0;
+	controls.manualRangeMinC      = 20.0f;
+	controls.manualRangeMaxC      = 45.0f;
+	controls.roiMode              = ROI_MODE_OFF;
+	controls.roiRectPercent       = 25;
+	controls.isothermEnabled      = 0;
+	controls.isothermThresholdC   = 60.0f;
 	resetDisplayTemporalDenoise();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
@@ -3008,6 +3055,29 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		frameKelvinMax    =  kmax;
 		frameKelvinRange  = (kmax - kmin);
 
+		if ( controls.manualRangeEnabled ) {
+			unsigned short manualMin = displayedCelsiusToKelvin( controls.manualRangeMinC );
+			unsigned short manualMax = displayedCelsiusToKelvin( controls.manualRangeMaxC );
+			if ( manualMax <= manualMin ) {
+				if ( USHRT_MAX == manualMin ) {
+					manualMin--;
+				}
+				manualMax = manualMin + 1;
+			}
+			frameKelvinMin = manualMin;
+			frameKelvinMax = manualMax;
+			frameKelvinRange = manualMax - manualMin;
+
+			globalKelvinMin = manualMin;
+			globalKelvinMax = manualMax;
+			globalKelvinRange = frameKelvinRange;
+			globalImgMin = BASE_PIXEL;
+			globalImgMax = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+			globalImgRange = globalImgMax - globalImgMin;
+			globalImgMin_CLUT = 0;
+			globalImgMax_CLUT = (unsigned short)MAX_CLUT_PIX;
+		}
+
 		// Controls to [un]lock colormap auto-ranging
 		ptf->minPixel.kelvin   = kminPixel; // kelvin is NOT kelvin here
 		ptf->maxPixel.kelvin   = kmaxPixel; // kelvin is NOT kelvin here
@@ -3077,7 +3147,10 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 
 	// Colormap autoranging requires camera hardware control which we don't have
 
-	if ( lockAutoRanging ) {
+	if ( controls.manualRangeEnabled ) {
+		ptf->minPixel.celsius = controls.manualRangeMinC;
+		ptf->maxPixel.celsius = controls.manualRangeMaxC;
+	} else if ( lockAutoRanging ) {
 		ptf->minPixel.celsius = kelvin2Celsius( globalKelvinMin );
 		ptf->maxPixel.celsius = kelvin2Celsius( globalKelvinMax );
 	} else {
@@ -3109,10 +3182,12 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 	float chFraction  = ( 0.0 == minMaxRange ) ? 0.5 : (chRange / minMaxRange);
 
 	float minMaxRangeKelvin   = (ptf->max.kelvin - ptf->min.kelvin);
-	if ( lockAutoRanging ) {
+	float minScaleKelvin      = ptf->min.kelvin;
+	if ( controls.manualRangeEnabled || lockAutoRanging ) {
+		minScaleKelvin = globalKelvinMin;
 		minMaxRangeKelvin = (globalKelvinMax - globalKelvinMin);
 	}
-	ptf->chLevelPixel.kelvin  = ptf->min.kelvin + (minMaxRangeKelvin * chFraction);
+	ptf->chLevelPixel.kelvin  = minScaleKelvin + (minMaxRangeKelvin * chFraction);
 	ptf->chLevelPixel.linearI = (lminPixel + lmaxPixel) * chFraction;
 	ptf->chLevelPixel.celsius = minPixelCelsius + chRange;
 	ptf->chLevelPixel.row     = TC_HEIGHT * (1.0 - chFraction);
@@ -3126,9 +3201,9 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 	calcTempDisplayLocations( ptf->chLevelPixel );
 
 	if ( RERENDER_OPTIMIZATION ) {
-		if ( lockAutoRanging ) {
-//strcpy( ptf->chLevelPixel.displayLabel,  ">" );
-//strcpy( ptf->avgLevelPixel.displayLabel, "-" );
+		if ( controls.manualRangeEnabled || lockAutoRanging ) {
+	//strcpy( ptf->chLevelPixel.displayLabel,  ">" );
+	//strcpy( ptf->avgLevelPixel.displayLabel, "-" );
 			ptf->minPixel.kelvin   = globalKelvinMin;
 			ptf->maxPixel.kelvin   = globalKelvinMax;
 		}
@@ -3672,6 +3747,7 @@ void printUsage() {
   printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
+  printf( "                 [-control-pipe name] for live Windows GUI controls\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -3855,19 +3931,11 @@ FILTER_TYPE_CHANGE:
 			  break;
 
 
-		case 'l': lockAutoRanging = (lockAutoRanging + 1) % AUTO_RANGE_MAX;
-			  threadData.configurationChanged++;
-			  setHudLock();
-			  {
-				// Reset autoRanging controls
-				globalKelvinMin = USHRT_MAX;
-				globalKelvinMax = 0;
-				globalImgMin    = USHRT_MAX;
-				globalImgMax    = 0;
-				frameImgMin     = USHRT_MAX;
-				frameImgMax     = 0;
-			  }
-			  break;
+			case 'l': lockAutoRanging = (lockAutoRanging + 1) % AUTO_RANGE_MAX;
+				  threadData.configurationChanged++;
+				  setHudLock();
+				  resetAutoRangeExtrema();
+				  break;
 
 		case 'y': 
 			  threadData.configurationChanged++;
@@ -4368,6 +4436,125 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	}
 	POINT( hudPoint, L_X, Y(8) ); 
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+}
+
+static Rect displayPaneRect( Mat &frame ) {
+	int width = min( controls.scaledSFWidth, frame.cols );
+	int height = min( controls.scaledSFHeight, frame.rows );
+	return Rect( 0, 0, max(width, 1), max(height, 1) );
+}
+
+static void drawOverlayText( Mat &frame, const char *text, Point loc, Scalar color ) {
+	double fontScale = max( 0.35, (double)MyFontScale );
+	putText( frame, text, loc, Default_Font, fontScale, BLACK, 3, LINE_AA );
+	putText( frame, text, loc, Default_Font, fontScale, color, 1, LINE_AA );
+}
+
+static void drawIsothermOverlay( Mat &frame ) {
+	if ( ! controls.isothermEnabled || thermalFrame.empty() || frame.empty() ) {
+		return;
+	}
+
+	Rect pane = displayPaneRect( frame );
+	Mat mask( TC_HEIGHT, TC_WIDTH, CV_8UC1 );
+	unsigned char *maskPtr = mask.ptr<unsigned char>(0);
+	unsigned short *thermalPtr = &((unsigned short *)(thermalFrame.datastart))[0];
+	int maxPixels = TC_WIDTH * TC_HEIGHT;
+	for ( int i = 0; i < maxPixels; i++ ) {
+		maskPtr[i] = ( kelvin2Celsius( thermalPtr[i] ) >= controls.isothermThresholdC ) ? 255 : 0;
+	}
+
+	Mat scaledMask;
+	resize( mask, scaledMask, Size( pane.width, pane.height ), 0.0, 0.0, INTER_NEAREST );
+	Mat target = frame( pane );
+	Mat hot( target.size(), target.type(), Scalar( 0, 0, 255 ) );
+	Mat blended;
+	addWeighted( target, 0.45, hot, 0.55, 0.0, blended );
+	blended.copyTo( target, scaledMask );
+}
+
+static void drawSpotOverlay( Mat &frame, ProcessedThermalFrame *ptf ) {
+	Rect pane = displayPaneRect( frame );
+	Point center( pane.x + pane.width / 2, pane.y + pane.height / 2 );
+	line( frame, Point( center.x - 12, center.y ), Point( center.x + 12, center.y ), WHITE, 1, LINE_AA );
+	line( frame, Point( center.x, center.y - 12 ), Point( center.x, center.y + 12 ), WHITE, 1, LINE_AA );
+	circle( frame, center, 5, BLACK, 2, LINE_AA );
+	circle( frame, center, 5, YELLOW, 1, LINE_AA );
+
+	char buf[128];
+	snprintf( buf, sizeof(buf), "Spot %.1f%s", CorF(ptf->ch.celsius), controls.labelCF );
+	Point textLoc( min( center.x + 10, pane.x + pane.width - 90 ), max( center.y - 10, pane.y + 18 ) );
+	drawOverlayText( frame, buf, textLoc, YELLOW );
+}
+
+static void drawRectRoiOverlay( Mat &frame ) {
+	if ( thermalFrame.empty() ) {
+		return;
+	}
+
+	int percent = controls.roiRectPercent;
+	if ( percent < 5 ) {
+		percent = 5;
+	} else if ( percent > 100 ) {
+		percent = 100;
+	}
+
+	int roiW = max( 1, (TC_WIDTH  * percent) / 100 );
+	int roiH = max( 1, (TC_HEIGHT * percent) / 100 );
+	int roiX = (TC_WIDTH  - roiW) / 2;
+	int roiY = (TC_HEIGHT - roiH) / 2;
+
+	unsigned short *thermalPtr = &((unsigned short *)(thermalFrame.datastart))[0];
+	unsigned short minKelvin = USHRT_MAX;
+	unsigned short maxKelvin = 0;
+	unsigned long long totalKelvin = 0;
+	unsigned long count = 0;
+	for ( int y = roiY; y < roiY + roiH; y++ ) {
+		unsigned short *row = &thermalPtr[ y * TC_WIDTH ];
+		for ( int x = roiX; x < roiX + roiW; x++ ) {
+			unsigned short kelvin = row[x];
+			if ( minKelvin > kelvin ) {
+				minKelvin = kelvin;
+			}
+			if ( maxKelvin < kelvin ) {
+				maxKelvin = kelvin;
+			}
+			totalKelvin += kelvin;
+			count++;
+		}
+	}
+	if ( 0 == count ) {
+		return;
+	}
+
+	Rect pane = displayPaneRect( frame );
+	Rect scaledRoi( pane.x + roiX * MyScale, pane.y + roiY * MyScale,
+	                max(1, roiW * MyScale), max(1, roiH * MyScale) );
+	scaledRoi &= pane;
+	if ( scaledRoi.width <= 0 || scaledRoi.height <= 0 ) {
+		return;
+	}
+
+	rectangle( frame, scaledRoi, BLACK, 3, LINE_AA );
+	rectangle( frame, scaledRoi, GREEN, 1, LINE_AA );
+
+	float minC = kelvin2Celsius( minKelvin );
+	float avgC = kelvin2Celsius( (unsigned short)( totalKelvin / count ) );
+	float maxC = kelvin2Celsius( maxKelvin );
+	char buf[160];
+	snprintf( buf, sizeof(buf), "ROI min %.1f avg %.1f max %.1f%s",
+	          CorF(minC), CorF(avgC), CorF(maxC), controls.labelCF );
+	Point textLoc( scaledRoi.x, max( pane.y + 18, scaledRoi.y - 6 ) );
+	drawOverlayText( frame, buf, textLoc, GREEN );
+}
+
+static void drawAnalysisOverlays( Mat &frame, ProcessedThermalFrame *ptf ) {
+	drawIsothermOverlay( frame );
+	if ( ROI_MODE_SPOT == controls.roiMode ) {
+		drawSpotOverlay( frame, ptf );
+	} else if ( ROI_MODE_RECT == controls.roiMode ) {
+		drawRectRoiOverlay( frame );
+	}
 }
 
 
@@ -5948,6 +6135,9 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			controls.sharpenLevel = level;
 			threadData.configurationChanged++;
 			i++;
+		} else if ( ! strcmp( argv[i], "-control-pipe") && hasNext ) {
+			controlPipeName = argv[ i + 1 ];
+			i++;
 		} else if ( ! strcmp( argv[i], "-fps") && hasNext ) {
 			offline_fps = abs( atoi( argv[ i + 1 ] ) );
 			i++;
@@ -6034,6 +6224,424 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 
 	return inputNotFound;
 }
+
+static std::string trimControlString( const std::string &value ) {
+	size_t start = value.find_first_not_of(" \t\r\n");
+	if ( start == std::string::npos ) {
+		return "";
+	}
+	size_t end = value.find_last_not_of(" \t\r\n");
+	return value.substr(start, end - start + 1);
+}
+
+static std::string lowerControlString( std::string value ) {
+	for ( char &ch : value ) {
+		ch = (char)tolower((unsigned char)ch);
+	}
+	return value;
+}
+
+static bool parseControlBool( const std::string &value ) {
+	return value == "1" ||
+	       value == "on" ||
+	       value == "true" ||
+	       value == "yes" ||
+	       value == "enabled";
+}
+
+static void setRuntimeScale( ProcessedThermalFrame *ptf, int scale ) {
+	int target = parseScaleValue( std::to_string(scale).c_str() );
+	if ( target == MyScale ) {
+		return;
+	}
+	if ( controls.recording ) {
+		recording( ptf, 1 );
+	}
+	threadData.configurationChanged++;
+	MyScale = target;
+	MyHalfScale = MyScale / 2;
+	horizFlickerTomFoolery();
+	setScaleControls();
+	resetDisplayTemporalDenoise();
+	if ( ! controls.fullscreen ) {
+		resizeWindow( ptf );
+	}
+	if ( rulersOn ) {
+		rulers( ptf, rulersX, rulersY, 0 );
+	}
+}
+
+static void setRuntimeRotation( ProcessedThermalFrame *ptf, int degrees ) {
+	int target = DECODE_ROTATION( degrees );
+	if ( target < 0 || target > 3 ) {
+		target = 0;
+	}
+	while ( RotateDisplay != target ) {
+		rotateDisplay( ptf, 1 );
+	}
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeFullscreen( ProcessedThermalFrame *ptf, bool enabled ) {
+	if ( controls.fullscreen != enabled ) {
+		toggleFullScreen( ptf );
+	}
+}
+
+static void setRuntimeDisplayLevel( int &target, const std::string &value ) {
+	int level = parseDisplayLevel( value.c_str() );
+	if ( level < 0 ) {
+		return;
+	}
+	if ( target != level ) {
+		target = level;
+		threadData.configurationChanged++;
+	}
+}
+
+static void setRuntimeMappingFilter( int value ) {
+	if ( value < 0 ) {
+		value = 0;
+	}
+	if ( value >= FILTER_TYPE_MAX ) {
+		value = FILTER_TYPE_MAX - 1;
+	}
+	filterType = value;
+	thermalRangeFilter_FxPtr = (FILTER_TYPE_LINEAR == filterType) ?
+		&thermalRangeFilter_Linear :
+		&thermalRangeFilter_Generic;
+	filterType2 = ((FILTER_TYPE_LINEAR_2 == filterType) ||
+	               (FILTER_TYPE_CENTER_2 == filterType) ||
+	               (FILTER_TYPE_OUTER_2  == filterType));
+	threadData.configurationChanged++;
+	setHudLock();
+}
+
+static void setRuntimeAutoRange( int value ) {
+	if ( value < AUTO_RANGE_NONE ) {
+		value = AUTO_RANGE_NONE;
+	}
+	if ( value >= AUTO_RANGE_MAX ) {
+		value = AUTO_RANGE_MAX - 1;
+	}
+	lockAutoRanging = value;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+	setHudLock();
+}
+
+static void setRuntimeManualRange( bool enabled, float minC, float maxC ) {
+	if ( maxC <= minC ) {
+		maxC = minC + 1.0f;
+	}
+	controls.manualRangeEnabled = enabled ? 1 : 0;
+	controls.manualRangeMinC = minC;
+	controls.manualRangeMaxC = maxC;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeRoiMode( const std::string &value ) {
+	std::string mode = lowerControlString( value );
+	if ( mode == "off" || mode == "0" ) {
+		controls.roiMode = ROI_MODE_OFF;
+	} else if ( mode == "spot" || mode == "point" || mode == "1" ) {
+		controls.roiMode = ROI_MODE_SPOT;
+	} else if ( mode == "rect" || mode == "rectangle" || mode == "box" || mode == "2" ) {
+		controls.roiMode = ROI_MODE_RECT;
+	}
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeRulerMode( ProcessedThermalFrame *ptf, int value ) {
+	if ( value < 0 ) {
+		value = 0;
+	}
+	rulersOn = (RulerModes)( value % (int)RULERS_MAX_MOD );
+	threadData.configurationChanged++;
+	if ( rulersOn ) {
+		rulers( ptf, rulersX, rulersY, 0 );
+	} else {
+		clearUserTemps( ptf );
+	}
+}
+
+static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &name ) {
+	std::string preset = lowerControlString( name );
+	if ( preset == "raw" ) {
+		controls.cmapCurrent = 0;
+		controls.rad = 0;
+		controls.displayFilterPreset = 0;
+		controls.bilateralLevel = 0;
+		controls.temporalDenoiseLevel = 0;
+		controls.sharpenLevel = 0;
+		controls.isothermEnabled = 0;
+		controls.manualRangeEnabled = 0;
+	} else if ( preset == "pcb" ) {
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "lanczos" );
+		controls.cmapCurrent = min( 27, MAX_CMAPS - 1 );
+		controls.displayFilterPreset = 1;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 1;
+		controls.sharpenLevel = 2;
+		controls.isothermEnabled = 1;
+		controls.isothermThresholdC = 55.0f;
+	} else if ( preset == "hvac" ) {
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "lanczos" );
+		controls.cmapCurrent = 4;
+		controls.displayFilterPreset = 2;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 1;
+		controls.sharpenLevel = 1;
+		controls.isothermEnabled = 1;
+		controls.isothermThresholdC = 35.0f;
+	} else if ( preset == "human" ) {
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "cubic" );
+		controls.cmapCurrent = 17 < MAX_CMAPS ? 17 : 4;
+		controls.displayFilterPreset = 1;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 2;
+		controls.sharpenLevel = 1;
+		setRuntimeManualRange( true, 20.0f, 42.0f );
+	} else if ( preset == "low-noise" || preset == "low_noise" ) {
+		controls.displayFilterPreset = 2;
+		controls.bilateralLevel = 2;
+		controls.temporalDenoiseLevel = 2;
+		controls.sharpenLevel = 1;
+	} else if ( preset == "high-contrast" || preset == "high_contrast" ) {
+		controls.alpha = 1.35;
+		controls.displayFilterPreset = 0;
+		controls.bilateralLevel = 0;
+		controls.temporalDenoiseLevel = 0;
+		controls.sharpenLevel = 2;
+	}
+	resetDisplayTemporalDenoise();
+	threadData.configurationChanged++;
+}
+
+static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame *ptf, Mat *frame ) {
+	std::string trimmed = trimControlString( line );
+	if ( trimmed.empty() ) {
+		return;
+	}
+
+	std::istringstream iss( trimmed );
+	std::string command;
+	iss >> command;
+	command = lowerControlString( command );
+
+	if ( command == "snapshot" ) {
+		snapshot( frame, 0x00 );
+		threadData.configurationChanged++;
+		return;
+	}
+	if ( command == "record" ) {
+		recording( ptf, 0 );
+		threadData.configurationChanged++;
+		return;
+	}
+	if ( command == "reset" ) {
+		processKeypress( '5', ptf, frame );
+		return;
+	}
+	if ( command == "quit" || command == "exit" ) {
+		threadData.running = 0;
+		return;
+	}
+	if ( command == "preset" ) {
+		std::string preset;
+		iss >> preset;
+		setRuntimePreset( ptf, preset );
+		return;
+	}
+	if ( command != "set" ) {
+		return;
+	}
+
+	std::string key;
+	iss >> key;
+	key = lowerControlString( key );
+	std::string value;
+	std::getline( iss, value );
+	value = trimControlString( value );
+	std::string lowerValue = lowerControlString( value );
+
+	if ( key == "scale" || key == "display-scale" || key == "superres" || key == "super-resolution" ) {
+		setRuntimeScale( ptf, parseScaleValue( value.c_str() ) );
+	} else if ( key == "rotation" || key == "rotate" ) {
+		setRuntimeRotation( ptf, atoi( value.c_str() ) );
+	} else if ( key == "fullscreen" ) {
+		setRuntimeFullscreen( ptf, parseControlBool( lowerValue ) );
+	} else if ( key == "interp" || key == "interpolation" ) {
+		int index = parseInterpolationIndex( value.c_str() );
+		if ( 0 <= index ) {
+			controls.inters = index;
+			threadData.configurationChanged++;
+		}
+	} else if ( key == "cmap" || key == "colormap" ) {
+		controls.cmapCurrent = abs( atoi( value.c_str() ) ) % MAX_CMAPS;
+		threadData.configurationChanged++;
+	} else if ( key == "offset" || key == "temp-offset-c" || key == "offset-c" ) {
+		temperatureOffsetCelsius = (float)atof( value.c_str() );
+		resetAutoRangeExtrema();
+		threadData.configurationChanged++;
+	} else if ( key == "blur" || key == "box-blur" ) {
+		controls.rad = max( 0, atoi( value.c_str() ) );
+		threadData.configurationChanged++;
+	} else if ( key == "filter" || key == "filter-preset" || key == "display-filter" ) {
+		setRuntimeDisplayLevel( controls.displayFilterPreset, lowerValue );
+	} else if ( key == "bilateral" ) {
+		setRuntimeDisplayLevel( controls.bilateralLevel, lowerValue );
+	} else if ( key == "temporal" || key == "temporal-denoise" ) {
+		int before = controls.temporalDenoiseLevel;
+		setRuntimeDisplayLevel( controls.temporalDenoiseLevel, lowerValue );
+		if ( before != controls.temporalDenoiseLevel ) {
+			resetDisplayTemporalDenoise();
+		}
+	} else if ( key == "sharpen" ) {
+		setRuntimeDisplayLevel( controls.sharpenLevel, lowerValue );
+	} else if ( key == "threshold" || key == "threshold-c" ) {
+		controls.threshold.celsius = max( 0.0f, (float)atof( value.c_str() ) );
+		threadData.configurationChanged++;
+	} else if ( key == "autorange" || key == "auto-range" ) {
+		setRuntimeAutoRange( atoi( value.c_str() ) );
+	} else if ( key == "mapping" || key == "mapping-filter" ) {
+		setRuntimeMappingFilter( atoi( value.c_str() ) );
+	} else if ( key == "manual-range" ) {
+		std::istringstream rangeStream( value );
+		std::string enabled;
+		float minC = controls.manualRangeMinC;
+		float maxC = controls.manualRangeMaxC;
+		rangeStream >> enabled >> minC >> maxC;
+		setRuntimeManualRange( parseControlBool( lowerControlString(enabled) ), minC, maxC );
+	} else if ( key == "manual-enabled" ) {
+		setRuntimeManualRange( parseControlBool( lowerValue ), controls.manualRangeMinC, controls.manualRangeMaxC );
+	} else if ( key == "manual-min-c" ) {
+		setRuntimeManualRange( controls.manualRangeEnabled, (float)atof( value.c_str() ), controls.manualRangeMaxC );
+	} else if ( key == "manual-max-c" ) {
+		setRuntimeManualRange( controls.manualRangeEnabled, controls.manualRangeMinC, (float)atof( value.c_str() ) );
+	} else if ( key == "roi" || key == "roi-mode" ) {
+		setRuntimeRoiMode( lowerValue );
+	} else if ( key == "roi-size" || key == "roi-rect-percent" ) {
+		controls.roiRectPercent = max( 5, min( 100, atoi( value.c_str() ) ) );
+		threadData.configurationChanged++;
+	} else if ( key == "rulers" || key == "ruler-mode" ) {
+		setRuntimeRulerMode( ptf, atoi( value.c_str() ) );
+	} else if ( key == "isotherm" || key == "overtemp" ) {
+		controls.isothermEnabled = parseControlBool( lowerValue ) ? 1 : 0;
+		threadData.configurationChanged++;
+	} else if ( key == "isotherm-threshold-c" || key == "overtemp-c" ) {
+		controls.isothermThresholdC = (float)atof( value.c_str() );
+		threadData.configurationChanged++;
+	} else if ( key == "histogram" ) {
+		Use_Histogram = parseControlBool( lowerValue ) ? 1 : 0;
+		threadData.configurationChanged++;
+	}
+}
+
+#ifdef _WIN32
+static HANDLE controlPipe = INVALID_HANDLE_VALUE;
+static bool controlPipeConnected = false;
+static std::string controlPipeBuffer;
+
+static std::string controlPipePath() {
+	if ( controlPipeName.empty() ) {
+		return "";
+	}
+	if ( controlPipeName.rfind("\\\\.\\pipe\\", 0) == 0 ) {
+		return controlPipeName;
+	}
+	return "\\\\.\\pipe\\" + controlPipeName;
+}
+
+static void closeRuntimeControlPipe() {
+	if ( INVALID_HANDLE_VALUE != controlPipe ) {
+		DisconnectNamedPipe( controlPipe );
+		CloseHandle( controlPipe );
+		controlPipe = INVALID_HANDLE_VALUE;
+	}
+	controlPipeConnected = false;
+	controlPipeBuffer.clear();
+}
+
+static void initRuntimeControlPipe() {
+	if ( controlPipeName.empty() ) {
+		return;
+	}
+	std::string path = controlPipePath();
+	controlPipe = CreateNamedPipeA(
+		path.c_str(),
+		PIPE_ACCESS_INBOUND,
+		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+		1,
+		4096,
+		4096,
+		0,
+		NULL );
+	if ( INVALID_HANDLE_VALUE == controlPipe ) {
+		printf("%sControl pipe create failed (%lu): %s\n%s", RED_STR(), GetLastError(), path.c_str(), RESET_STR());
+		return;
+	}
+	printf("Control pipe: %s\n", path.c_str());
+}
+
+static void pollRuntimeControlPipe( ProcessedThermalFrame *ptf, Mat *frame ) {
+	if ( INVALID_HANDLE_VALUE == controlPipe ) {
+		return;
+	}
+
+	if ( ! controlPipeConnected ) {
+		BOOL connected = ConnectNamedPipe( controlPipe, NULL );
+		DWORD err = GetLastError();
+		if ( connected || ERROR_PIPE_CONNECTED == err ) {
+			controlPipeConnected = true;
+		} else if ( ERROR_PIPE_LISTENING == err || ERROR_NO_DATA == err ) {
+			return;
+		} else {
+			DisconnectNamedPipe( controlPipe );
+			return;
+		}
+	}
+
+	char buffer[512];
+	DWORD bytesRead = 0;
+	while ( ReadFile( controlPipe, buffer, sizeof(buffer), &bytesRead, NULL ) && bytesRead > 0 ) {
+		controlPipeBuffer.append( buffer, buffer + bytesRead );
+		size_t pos = 0;
+		while ( (pos = controlPipeBuffer.find('\n')) != std::string::npos ) {
+			std::string line = controlPipeBuffer.substr( 0, pos );
+			controlPipeBuffer.erase( 0, pos + 1 );
+			applyRuntimeControl( line, ptf, frame );
+		}
+		bytesRead = 0;
+	}
+
+	DWORD err = GetLastError();
+	if ( ERROR_BROKEN_PIPE == err || ERROR_NO_DATA == err ) {
+		if ( ! controlPipeBuffer.empty() ) {
+			applyRuntimeControl( controlPipeBuffer, ptf, frame );
+			controlPipeBuffer.clear();
+		}
+		DisconnectNamedPipe( controlPipe );
+		controlPipeConnected = false;
+	}
+}
+#else
+static void initRuntimeControlPipe() {
+	if ( ! controlPipeName.empty() ) {
+		printf("Control pipe is only active on Windows builds.\n");
+	}
+}
+
+static void pollRuntimeControlPipe( ProcessedThermalFrame *, Mat * ) {
+}
+
+static void closeRuntimeControlPipe() {
+}
+#endif
 
 
 #if BORDER_LAYOUT
@@ -6146,6 +6754,7 @@ int mainPrivate (int argc, char *argv[]) {
 		printUsage();
 		return -1;
 	}
+	initRuntimeControlPipe();
 
 	int64_t startup3 = currentTimeMicros();
 
@@ -6606,11 +7215,15 @@ int mainPrivate (int argc, char *argv[]) {
 		// while this main thread is finishing with the current frame and providing the next frame.
 		// Their thread states should be 0, or 3 transitioning to 0
 
-//printf("%s(%d) - Parallel worker threads finished %ld\n", __func__, __LINE__, currentTimeMicros()); FF();
+	//printf("%s(%d) - Parallel worker threads finished %ld\n", __func__, __LINE__, currentTimeMicros()); FF();
 
-		TS( int64_t imshowMicros = currentTimeMicros(); )
+			TS( int64_t imshowMicros = currentTimeMicros(); )
 
-#if BORDER_LAYOUT
+			if ( HUD_ONLY_VIDEO != controls.hud ) {
+				drawAnalysisOverlays( *threadData.rgbFrame, ptf );
+			}
+
+	#if BORDER_LAYOUT
 
 		{
 			// Render using squishy left and right borders.
@@ -6763,10 +7376,19 @@ int mainPrivate (int argc, char *argv[]) {
 #if 0
 		int c = -1; // 686 FPS without waiting 1ms, doesn't render graphics
 #else
-		// Use following sleepMicros() to throttle FPS
-		int c = (char)waitKeyEx( 1 );
+			// Use following sleepMicros() to throttle FPS
+			int c = (char)waitKeyEx( 1 );
 #endif
-			
+
+#if BORDER_LAYOUT
+			pollRuntimeControlPipe( ptf, &borderFrame );
+#else
+			pollRuntimeControlPipe( ptf, &rgbFrame );
+#endif
+			if ( ! threadData.running ) {
+				break;
+			}
+
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );
                         printf("\nTaking snapshot and exiting\n");
@@ -6832,10 +7454,12 @@ int mainPrivate (int argc, char *argv[]) {
 
 	} // End for loop
 
-SHUTDOWN:
+	SHUTDOWN:
 
-	// Tell threads to exit
-	exitAllThreads();
+		closeRuntimeControlPipe();
+
+		// Tell threads to exit
+		exitAllThreads();
  
 	if ( ! released && ! threadData.inputFile ) {
 		// When everything done, release the video capture and write object

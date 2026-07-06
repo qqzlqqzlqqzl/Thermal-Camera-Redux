@@ -36,10 +36,15 @@ From the extracted artifact folder:
 Thermal-Camera-Redux-GUI.exe
 ```
 
-This is the normal Windows entry point. The GUI saves settings in
-`thermal-camera-redux-gui.ini`, writes the exact command it launches to
-`thermal-camera-redux-last-command.txt`, and starts `Thermal-Camera-Redux.exe`
-from the same folder.
+This is the normal Windows entry point. The GUI is a live control panel: it
+saves settings in `thermal-camera-redux-gui.ini`, writes the exact command it
+launches to `thermal-camera-redux-last-command.txt`, starts
+`Thermal-Camera-Redux.exe` from the same folder, then sends runtime setting
+changes over a Windows named pipe.
+
+The GUI can switch between Chinese and English without restarting. Device index
+changes still require restart; display, filtering, ROI, range, and threshold
+changes are applied while the thermal window is running.
 
 The command-line launcher is still available:
 
@@ -83,11 +88,34 @@ Display enhancement controls:
 - `Bilateral`: display-only edge-preserving smoothing, Off/Low/Medium/Strong.
 - `Temporal denoise`: display-only frame blending, Off/Low/Medium/Strong.
 - `Sharpen`: display-only unsharp-mask sharpening, Off/Low/Medium/Strong.
+- `Blur`: classic display blur/smoothing, Off/Low/Medium/Strong.
+- `Manual temp range`: fixed min/max Celsius range for thermal-to-colormap
+  mapping. This is display mapping only; temperature calculations still use the
+  original thermal matrix.
+- `Auto range`: existing colormap range lock modes, exposed in the GUI.
+- `Range mapping`: existing nonlinear range mapping filters, exposed in the GUI.
+- `ROI mode`: center spot or center rectangle ROI overlay. Rectangle ROI shows
+  min/avg/max from the original thermal matrix.
+- `Isotherm / over-temp`: highlights pixels above the selected Celsius
+  threshold on the displayed frame.
+- `Snapshot`: writes the current PNG plus the original `.raw` frame.
+- `Record`: toggles the existing AVI recording path.
+- `Preset`: quick groups for PCB, HVAC, human body, low-noise, high-contrast,
+  and raw display workflows.
 
 These enhancement controls only affect the rendered display frame before the
 HUD/markers are drawn. Temperature readings, min/max/avg, center temperature,
-rulers, and `.raw` snapshots continue to use the original `256x192` thermal
-matrix.
+rulers, ROI statistics, and `.raw` snapshots continue to use the original
+`256x192` thermal matrix.
+
+The GUI live-control transport is started with:
+
+```bat
+Thermal-Camera-Redux.exe ... -control-pipe <pipe-name>
+```
+
+This is normally managed by `Thermal-Camera-Redux-GUI.exe`; direct users do not
+need to create the pipe manually.
 
 The tested Windows device list was:
 

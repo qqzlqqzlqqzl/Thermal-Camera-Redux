@@ -6,9 +6,9 @@
 		// Locking auto ranging puts early termal data mining requirements on 
 		// the image processing, thus processThermalFrame() gets called 
 		// earlier in IMAGE_0_CPP when lockAutoRanging is enabled
-		if ( ! lockAutoRanging && cameraHasImageFrame ) {
-			processThermalFrame( ptf, &thermalFrame );
-		}
+			if ( ! controls.manualRangeEnabled && ! lockAutoRanging && cameraHasImageFrame ) {
+				processThermalFrame( ptf, &thermalFrame );
+			}
 
                 if ( controls.hud != HUD_ONLY_VIDEO )
                 {
