@@ -48,6 +48,7 @@
 				     WINDOW_DOUBLE_HIGH == controls.windowFormat ) {
 					Mat scaledImageFrame;
 					Mat scaledThermalFrame;
+					Size paneSize;
 					SIZE( paneSize, controls.scaledSFWidth, controls.scaledSFHeight );
 					upscaleDisplaySource( rgbImageFrame, scaledImageFrame, paneSize );
 					upscaleDisplaySource( rgbThermalFrame, scaledThermalFrame, paneSize );

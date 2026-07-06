@@ -1682,6 +1682,7 @@ static const char *aiSuperResHudStatus() {
 	return option.shortName;
 }
 
+#if USE_DNN_SUPERRES
 static bool fileExists( const std::string &path ) {
 	return ! path.empty() && 0 == access( path.c_str(), F_OK );
 }
@@ -1741,6 +1742,7 @@ static std::vector<std::string> aiSuperResModelCandidates( const AiSuperResOptio
 	}
 	return paths;
 }
+#endif
 
 static bool loadAiSuperResModel( int mode ) {
 	if ( AI_SUPERRES_OFF == mode ) {
@@ -1797,6 +1799,10 @@ static bool loadAiSuperResModel( int mode ) {
 }
 
 static bool applyAiSuperResolution( const Mat &src, Mat &dst, const Size &targetSize ) {
+#if ! USE_DNN_SUPERRES
+	(void)dst;
+#endif
+
 	int mode = controls.aiSuperResMode;
 	if ( AI_SUPERRES_OFF == mode || src.empty() ) {
 		return false;
