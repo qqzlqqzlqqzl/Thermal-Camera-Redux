@@ -67,6 +67,8 @@ Extra arguments are passed through, for example:
 
 ```bat
 run_uti260b_windows.cmd 0 -rotate 0
+run_uti260b_windows.cmd 0 -celsius
+run_uti260b_windows.cmd 0 -fahrenheit
 run_uti260b_windows.cmd 0 -temp-offset-c -3.5
 run_uti260b_windows.cmd 0 -temp-offset-f -6.3
 run_uti260b_windows.cmd 0 -display-scale 4 -interp lanczos
@@ -84,6 +86,13 @@ Display enhancement controls:
   maximum scale.
 - `Interpolation`: classic software super-resolution/display upscale method.
   Supported GUI choices are Nearest, Bilinear, Bicubic, and Lanczos.
+- `Colormap`: pseudo-color palettes are labeled with readable names such as
+  Jet rainbow heat, Hot iron red, Turbo high contrast, Bone gray-white, and
+  Deep green. The numeric index is kept in parentheses only for reproducible
+  command-line use.
+- `Temperature unit`: live Celsius/Fahrenheit display switch. The GUI defaults
+  to Celsius and sends `-celsius` at launch; runtime changes use the live
+  control pipe and do not require restart.
 - `Filter preset`: display-only Gaussian smoothing, Off/Low/Medium/Strong.
 - `Bilateral`: display-only edge-preserving smoothing, Off/Low/Medium/Strong.
 - `Temporal denoise`: display-only frame blending, Off/Low/Medium/Strong.

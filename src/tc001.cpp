@@ -3420,9 +3420,14 @@ void reScale(ProcessedThermalFrame *ptf, int value, bool resize) {
 	}
 }
 
-void reCF() {
-	controls.useCelsius = Use_Celsius = !controls.useCelsius;
+static void setTemperatureUnitCelsius( bool useCelsius ) {
+	controls.useCelsius = Use_Celsius = useCelsius;
 	controls.labelCF = controls.useCelsius ? " C" : " F";
+	threadData.configurationChanged++;
+}
+
+void reCF() {
+	setTemperatureUnitCelsius( ! controls.useCelsius );
 }
 
 void reThreshold(int value) {
@@ -3821,6 +3826,7 @@ void printUsage() {
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
   printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
+  printf( "                 [-celsius] [-fahrenheit]\n");
   printf( "                 [-temp-offset-c n] [-temp-offset-f n] [-temp-drift-c-per-min n]\n");
   printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
@@ -4020,7 +4026,6 @@ FILTER_TYPE_CHANGE:
 			  Use_Histogram = !Use_Histogram; break; // Temp filter
 
 		case 't': 
-			  threadData.configurationChanged++;
 			  reCF(); break;           // Temp format
 
 		case 'h': hud(1); break;  // Display onscreen elements
@@ -6223,6 +6228,12 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			controls.sharpenLevel = level;
 			threadData.configurationChanged++;
 			i++;
+		} else if (( ! strcmp( argv[i], "-celsius") ||
+			     ! strcmp( argv[i], "-temp-celsius") )) {
+			setTemperatureUnitCelsius( true );
+		} else if (( ! strcmp( argv[i], "-fahrenheit") ||
+			     ! strcmp( argv[i], "-temp-fahrenheit") )) {
+			setTemperatureUnitCelsius( false );
 		} else if ( ! strcmp( argv[i], "-control-pipe") && hasNext ) {
 			controlPipeName = argv[ i + 1 ];
 			i++;
@@ -6583,6 +6594,12 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 	} else if ( key == "cmap" || key == "colormap" ) {
 		controls.cmapCurrent = abs( atoi( value.c_str() ) ) % MAX_CMAPS;
 		threadData.configurationChanged++;
+	} else if ( key == "unit" || key == "temp-unit" || key == "temperature-unit" ) {
+		if ( lowerValue == "c" || lowerValue == "celsius" ) {
+			setTemperatureUnitCelsius( true );
+		} else if ( lowerValue == "f" || lowerValue == "fahrenheit" ) {
+			setTemperatureUnitCelsius( false );
+		}
 	} else if ( key == "offset" || key == "temp-offset-c" || key == "offset-c" ) {
 		temperatureOffsetCelsius = (float)atof( value.c_str() );
 		resetAutoRangeExtrema();

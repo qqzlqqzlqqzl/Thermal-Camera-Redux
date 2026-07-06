@@ -59,6 +59,7 @@ static const int IDC_HISTOGRAM = 1032;
 static const int IDC_RULERS = 1033;
 static const int IDC_DRIFT = 1034;
 static const int IDC_CONTRAST = 1035;
+static const int IDC_TEMP_UNIT = 1036;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -70,6 +71,7 @@ static HWND g_rotation;
 static HWND g_scale;
 static HWND g_interp;
 static HWND g_cmap;
+static HWND g_tempUnit;
 static HWND g_offset;
 static HWND g_drift;
 static HWND g_filter;
@@ -115,6 +117,11 @@ static std::string g_pipeName;
 static std::vector<ComboItem> g_languageItems = {
 	{ L"中文", L"中文", "zh-CN" },
 	{ L"English", L"English", "en-US" }
+};
+
+static std::vector<ComboItem> g_tempUnitItems = {
+	{ L"Celsius (C)", L"摄氏度 (C)", "celsius" },
+	{ L"Fahrenheit (F)", L"华氏度 (F)", "fahrenheit" }
 };
 
 static std::vector<ComboItem> g_rotationItems = {
@@ -348,6 +355,7 @@ static bool isPresetOwnedControl(int id) {
 		case IDC_SCALE:
 		case IDC_INTERP:
 		case IDC_CMAP:
+		case IDC_TEMP_UNIT:
 		case IDC_OFFSET:
 		case IDC_DRIFT:
 		case IDC_FILTER:
@@ -394,24 +402,35 @@ static void initCmapItems() {
 	if ( ! g_cmapValues.empty() ) {
 		return;
 	}
-	for (int i = 0; i <= 36; i++) {
+	static const wchar_t *labelsEn[] = {
+		L"No pseudo-color", L"Autumn yellow-red", L"Inverse autumn", L"Bone gray-white",
+		L"Jet rainbow heat", L"Inverse jet", L"Winter blue-green", L"Rainbow",
+		L"Inverse rainbow", L"Ocean deep blue", L"Inverse ocean", L"Summer green-yellow",
+		L"Spring magenta-yellow", L"Cool cyan-magenta", L"HSV full hue", L"Inverse HSV",
+		L"Pink gray-pink", L"Hot iron red", L"Cold inverse hot", L"Parula blue-yellow",
+		L"Magma black-red-yellow", L"Inferno black-red-yellow", L"Plasma purple-yellow",
+		L"Viridis blue-green-yellow", L"Cividis balanced", L"Twilight cyclic",
+		L"Twilight shifted", L"Turbo high contrast", L"Inverse turbo", L"Deep green",
+		L"HSL hot-to-cold", L"HSL cold-to-hot", L"Red to blue", L"Cold to black linear",
+		L"Cold to black curved", L"Cold to white linear", L"Cold to white curved"
+	};
+	static const wchar_t *labelsZh[] = {
+		L"无伪彩", L"暖黄红", L"反向暖黄红", L"灰白骨色",
+		L"Jet 彩虹热图", L"反向 Jet 彩虹", L"冬季蓝绿", L"彩虹",
+		L"反向彩虹", L"海洋深蓝", L"反向海洋蓝", L"夏季绿黄",
+		L"春季紫黄", L"冷色青紫", L"HSV 色相环", L"反向 HSV",
+		L"粉灰", L"Hot 铁红", L"Cold 冷色", L"Parula 蓝黄",
+		L"Magma 岩浆", L"Inferno 黑红黄", L"Plasma 紫黄高对比",
+		L"Viridis 蓝绿黄", L"Cividis 均衡蓝黄", L"Twilight 暮光循环",
+		L"Twilight Shift 移位暮光", L"Turbo 高对比", L"反向 Turbo", L"深绿",
+		L"HSL 热到冷", L"HSL 冷到热", L"红蓝", L"冷色到黑 线性",
+		L"冷色到黑 弧形", L"冷色到白 线性", L"冷色到白 弧形"
+	};
+	for (int i = 0; i < (int)(sizeof(labelsEn) / sizeof(labelsEn[0])); i++) {
 		std::wostringstream en;
 		std::wostringstream zh;
-		en << i;
-		zh << i;
-		if ( i == 0 ) {
-			en << L" None";
-			zh << L" 无伪彩";
-		} else if ( i == 4 ) {
-			en << L" Jet default";
-			zh << L" Jet 默认";
-		} else if ( i == 17 ) {
-			en << L" Hot";
-			zh << L" Hot 铁红";
-		} else if ( i == 27 ) {
-			en << L" Turbo";
-			zh << L" Turbo 高对比";
-		}
+		en << labelsEn[i] << L" (#" << i << L")";
+		zh << labelsZh[i] << L"（#" << i << L"）";
 		g_cmapLabelsEn.push_back(en.str());
 		g_cmapLabelsZh.push_back(zh.str());
 		g_cmapValues.push_back(std::to_string(i));
@@ -462,6 +481,7 @@ static std::wstring buildCommandLineFromValues(
 	const std::string &scaleValue,
 	const std::string &interpValue,
 	const std::string &cmapValue,
+	const std::string &tempUnitValue,
 	const std::string &offsetValue,
 	const std::string &driftValue,
 	const std::string &filterValue,
@@ -484,6 +504,7 @@ static std::wstring buildCommandLineFromValues(
 	    << L" -display-scale " << quoteArgW(widenAscii(scaleValue))
 	    << L" -interp " << quoteArgW(widenAscii(interpValue))
 	    << L" -cmap " << quoteArgW(widenAscii(cmapValue))
+	    << (tempUnitValue == "fahrenheit" ? L" -fahrenheit" : L" -celsius")
 	    << L" -temp-offset-c " << quoteArgW(offset)
 	    << L" -temp-drift-c-per-min " << quoteArgW(drift)
 	    << L" -filter-preset " << quoteArgW(widenAscii(filterValue))
@@ -505,6 +526,7 @@ static std::wstring buildCommandLine() {
 		comboValue(g_scale, g_scaleItems),
 		comboValue(g_interp, g_interpItems),
 		selectedCmapValue(),
+		comboValue(g_tempUnit, g_tempUnitItems),
 		textOfAscii(g_offset),
 		textOfAscii(g_drift),
 		comboValue(g_filter, g_levelItems),
@@ -544,6 +566,7 @@ static void saveSettings() {
 	writeIni("scale", comboValue(g_scale, g_scaleItems));
 	writeIni("interp", comboValue(g_interp, g_interpItems));
 	writeIni("cmap", selectedCmapValue());
+	writeIni("temp_unit", comboValue(g_tempUnit, g_tempUnitItems));
 	writeIni("offset_c", textOfAscii(g_offset));
 	writeIni("drift_c_per_min", textOfAscii(g_drift));
 	writeIni("filter", comboValue(g_filter, g_levelItems));
@@ -580,6 +603,7 @@ static void applyLanguageToUi() {
 	reloadCombo(g_scale, g_scaleItems, comboValue(g_scale, g_scaleItems), 3);
 	reloadCombo(g_interp, g_interpItems, comboValue(g_interp, g_interpItems), 2);
 	reloadCmapCombo(selectedCmapValue());
+	reloadCombo(g_tempUnit, g_tempUnitItems, comboValue(g_tempUnit, g_tempUnitItems), 0);
 	reloadCombo(g_filter, g_levelItems, comboValue(g_filter, g_levelItems), 0);
 	reloadCombo(g_bilateral, g_levelItems, comboValue(g_bilateral, g_levelItems), 0);
 	reloadCombo(g_temporal, g_levelItems, comboValue(g_temporal, g_levelItems), 0);
@@ -603,6 +627,7 @@ static void resetDefaults() {
 	selectComboByValue(g_scale, g_scaleItems, "4", 3);
 	selectComboByValue(g_interp, g_interpItems, "lanczos", 3);
 	reloadCmapCombo("4");
+	selectComboByValue(g_tempUnit, g_tempUnitItems, "celsius", 0);
 	setText(g_offset, L"0.0");
 	setText(g_drift, L"0.0");
 	selectComboByValue(g_filter, g_levelItems, "off", 0);
@@ -638,6 +663,7 @@ static void loadSettings() {
 	selectComboByValue(g_scale, g_scaleItems, readIni("scale", "4"), 3);
 	selectComboByValue(g_interp, g_interpItems, readIni("interp", "lanczos"), 3);
 	reloadCmapCombo(readIni("cmap", "4"));
+	selectComboByValue(g_tempUnit, g_tempUnitItems, readIni("temp_unit", "celsius"), 0);
 	setText(g_offset, widenAscii(readIni("offset_c", "0.0")));
 	setText(g_drift, widenAscii(readIni("drift_c_per_min", "0.0")));
 	selectComboByValue(g_filter, g_levelItems, readIni("filter", "off"), 0);
@@ -748,6 +774,11 @@ static void createControls(HWND hwnd) {
 	addLabel(hwnd, L"Colormap", L"伪彩色", labelX, y, labelW, rowH);
 	g_cmap = addCombo(hwnd, IDC_CMAP, controlX, y - 2, controlW, 360);
 	reloadCmapCombo("4");
+	y += gap;
+
+	addLabel(hwnd, L"Temperature unit", L"温度单位", labelX, y, labelW, rowH);
+	g_tempUnit = addCombo(hwnd, IDC_TEMP_UNIT, controlX, y - 2, controlW, 120);
+	addComboItems(g_tempUnit, g_tempUnitItems);
 	y += gap;
 
 	addLabel(hwnd, L"Temp offset C", L"温度偏移 C", labelX, y, labelW, rowH);
@@ -954,6 +985,7 @@ static std::string allLiveSettingsCommand() {
 	appendSet(cmd, "scale", comboValue(g_scale, g_scaleItems));
 	appendSet(cmd, "interp", comboValue(g_interp, g_interpItems));
 	appendSet(cmd, "cmap", selectedCmapValue());
+	appendSet(cmd, "temp-unit", comboValue(g_tempUnit, g_tempUnitItems));
 	appendSet(cmd, "offset-c", textOfAscii(g_offset));
 	appendSet(cmd, "drift-c-per-min", textOfAscii(g_drift));
 	appendSet(cmd, "blur", comboValue(g_blur, g_blurItems));
@@ -998,6 +1030,7 @@ static void sendChangedControl(int id) {
 		case IDC_SCALE: sendLiveCommand("set scale " + comboValue(g_scale, g_scaleItems)); break;
 		case IDC_INTERP: sendLiveCommand("set interp " + comboValue(g_interp, g_interpItems)); break;
 		case IDC_CMAP: sendLiveCommand("set cmap " + selectedCmapValue()); break;
+		case IDC_TEMP_UNIT: sendLiveCommand("set temp-unit " + comboValue(g_tempUnit, g_tempUnitItems)); break;
 		case IDC_OFFSET:
 			if ( looksNumeric(g_offset) ) sendLiveCommand("set offset-c " + textOfAscii(g_offset));
 			break;
@@ -1268,7 +1301,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static int dryRun() {
 	std::wstring commandLine = buildCommandLineFromValues(
-		"0", "90", "4", "lanczos", "4", "0.0", "0.0",
+		"0", "90", "4", "lanczos", "4", "celsius", "0.0", "0.0",
 		"off", "off", "off", "off", false, "dry-run-pipe");
 	writeLastCommand(commandLine);
 	if ( commandLine.find(L"Thermal-Camera-Redux.exe") == std::wstring::npos ) {
@@ -1276,6 +1309,9 @@ static int dryRun() {
 	}
 	if ( commandLine.find(L"-control-pipe") == std::wstring::npos ) {
 		return 2;
+	}
+	if ( commandLine.find(L"-celsius") == std::wstring::npos ) {
+		return 3;
 	}
 	return 0;
 }
@@ -1302,7 +1338,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR cmdLine, int nCmdShow) 
 
 	HWND hwnd = CreateWindowExW(0, wc.lpszClassName, g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-		CW_USEDEFAULT, CW_USEDEFAULT, 660, 960,
+		CW_USEDEFAULT, CW_USEDEFAULT, 660, 990,
 		NULL, NULL, hInstance, NULL);
 	if ( ! hwnd ) {
 		return 1;
