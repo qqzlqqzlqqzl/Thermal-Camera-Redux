@@ -150,6 +150,8 @@ using namespace cv;
 #endif
 
 static int offline_fps = OFFLINE_FPS;
+static long perfFrameInterval = (long)(20.0 * 25.0);
+static long benchmarkFrames = 0;
 
 #define helpLineType		LINE_8
 #define hudLineType		LINE_8
@@ -4104,6 +4106,7 @@ void printUsage() {
   printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
   printf( "                 [-control-pipe name] for live Windows GUI controls\n");
+  printf( "                 [-perf-frames n] [-benchmark-frames n] for deterministic CLI performance tests\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -6553,6 +6556,12 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 		} else if ( ! strcmp( argv[i], "-fps") && hasNext ) {
 			offline_fps = abs( atoi( argv[ i + 1 ] ) );
 			i++;
+		} else if ( ! strcmp( argv[i], "-perf-frames") && hasNext ) {
+			perfFrameInterval = max( 1, abs( atoi( argv[ i + 1 ] ) ) );
+			i++;
+		} else if ( ! strcmp( argv[i], "-benchmark-frames") && hasNext ) {
+			benchmarkFrames = max( 1, abs( atoi( argv[ i + 1 ] ) ) );
+			i++;
 		} else if ( ! strcmp( argv[i], "-profile") && hasNext ) {
 			if ( setCameraProfile( argv[ i + 1 ] ) < 0 ) {
 				return -1;
@@ -7790,9 +7799,9 @@ int mainPrivate (int argc, char *argv[]) {
 
 		TS( threadData.mainMicros += currentTimeMicros() - mainMicros; ) // track linear read and processing
 
-#define N_FRAMES (20.0 * 25.0) // Stat log average timings every N_FRAMES
+#define N_FRAMES ((double)perfFrameInterval) // Stat log average timings every N_FRAMES
 
-		if (0 == (controls.frameCounter % (long)N_FRAMES)) {
+		if (0 == (controls.frameCounter % perfFrameInterval)) {
 
 		    if ( ! quietStdout ) {
 
@@ -7835,6 +7844,7 @@ int mainPrivate (int argc, char *argv[]) {
 				threadData.horizMicros / 1000.0 / N_FRAMES, 
 				threadData.vertMicros  / 1000.0 / N_FRAMES
 				);
+			FF();
 		    }
 
 			threadData.thermMicros = threadData.imageMicros = threadData.rotMicros    = 0;
@@ -7928,6 +7938,10 @@ int mainPrivate (int argc, char *argv[]) {
 #endif
 
 		if ('q' == c) {
+			break;
+		}
+
+		if (0 < benchmarkFrames && controls.frameCounter >= benchmarkFrames) {
 			break;
 		}
 
