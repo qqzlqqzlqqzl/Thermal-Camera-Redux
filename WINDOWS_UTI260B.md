@@ -51,6 +51,10 @@ The GUI can switch between Chinese and English without restarting. Device index
 changes still require restart; display, filtering, ROI, range, and threshold
 changes are applied while the thermal window is running.
 
+For a control-by-control Chinese manual, open
+`THERMAL_CAMERA_GUI_MANUAL_zh-CN.md` from the runtime folder or press the GUI
+`说明书` button.
+
 The command-line launcher is still available:
 
 ```bat

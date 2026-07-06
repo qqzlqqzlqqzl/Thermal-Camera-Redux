@@ -111,6 +111,7 @@ jobs:
           cp Thermal-Camera-Redux-GUI.exe ../dist/windows-x64/
           cp ../run_uti260b_windows.cmd ../dist/windows-x64/
           cp ../WINDOWS_UTI260B.md ../dist/windows-x64/
+          cp ../THERMAL_CAMERA_GUI_MANUAL_zh-CN.md ../dist/windows-x64/
           mkdir -p ../dist/windows-x64/models
           download_model() {
             local url="$1"
@@ -223,6 +224,12 @@ jobs:
           }
           if (-not (Test-Path .\models\FSRCNN_x2.pb) -or -not (Test-Path .\models\ESPCN_x2.pb)) {
             throw 'AI super-resolution models are missing from packaged runtime'
+          }
+          if (-not (Test-Path .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md)) {
+            throw 'GUI manual is missing from packaged runtime'
+          }
+          if (-not (Select-String -LiteralPath .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md -SimpleMatch '黑体校准' -Quiet)) {
+            throw 'GUI manual does not document blackbody calibration'
           }
           if (-not $acceptedHelpExit) {
             $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'

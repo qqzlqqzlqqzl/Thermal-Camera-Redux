@@ -63,6 +63,7 @@ static const int IDC_TEMP_UNIT = 1036;
 static const int IDC_AI_SUPERRES = 1037;
 static const int IDC_BLACKBODY_TARGET = 1038;
 static const int IDC_BLACKBODY_CALIBRATE = 1039;
+static const int IDC_OPEN_MANUAL = 1040;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -94,6 +95,7 @@ static HWND g_snapshot;
 static HWND g_record;
 static HWND g_runtimeReset;
 static HWND g_resetDefaults;
+static HWND g_openManual;
 static HWND g_preset;
 static HWND g_blur;
 static HWND g_contrast;
@@ -291,6 +293,10 @@ static std::wstring quoteArgW(const std::wstring &arg) {
 
 static std::wstring iniPathW() {
 	return joinPathW(exeDirW(), L"thermal-camera-redux-gui.ini");
+}
+
+static std::wstring manualPathW() {
+	return joinPathW(exeDirW(), L"THERMAL_CAMERA_GUI_MANUAL_zh-CN.md");
 }
 
 static std::string readIni(const char *key, const char *fallback) {
@@ -869,165 +875,180 @@ static HWND addCheckbox(HWND parent, int id, const wchar_t *en, const wchar_t *z
 static void createControls(HWND hwnd) {
 	g_main = hwnd;
 	g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-	int y = 14;
-	int labelX = 18;
-	int controlX = 170;
-	int labelW = 140;
-	int controlW = 210;
-	int rightX = 398;
-	int rightW = 220;
+	int leftX = 18;
+	int rightColX = 500;
+	int labelW = 126;
+	int controlW = 190;
+	int leftControlX = leftX + labelW + 10;
+	int rightControlX = rightColX + labelW + 10;
 	int rowH = 23;
 	int gap = 27;
 
-	addLabel(hwnd, L"Language", L"语言", labelX, y, labelW, rowH);
-	g_language = addCombo(hwnd, IDC_LANGUAGE, controlX, y - 2, controlW, 160);
+	int yLeft = 14;
+	int yRight = 14;
+
+	addLabel(hwnd, L"Connection", L"连接", leftX, yLeft, labelW + controlW, rowH);
+	yLeft += gap;
+	addLabel(hwnd, L"Language", L"语言", leftX, yLeft, labelW, rowH);
+	g_language = addCombo(hwnd, IDC_LANGUAGE, leftControlX, yLeft - 2, controlW, 160);
 	addComboItems(g_language, g_languageItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Device index", L"设备序号", labelX, y, labelW, rowH);
-	g_device = addEdit(hwnd, IDC_DEVICE, controlX, y - 2, 80, rowH);
-	addLabel(hwnd, L"Change needs restart", L"修改后需重启", rightX, y, rightW, rowH);
-	y += gap;
+	addLabel(hwnd, L"Device index", L"设备序号", leftX, yLeft, labelW, rowH);
+	g_device = addEdit(hwnd, IDC_DEVICE, leftControlX, yLeft - 2, 74, rowH);
+	addLabel(hwnd, L"Restart needed", L"需重启", leftControlX + 84, yLeft, 88, rowH);
+	yLeft += gap;
 
-	addLabel(hwnd, L"Preset", L"预设方案", labelX, y, labelW, rowH);
-	g_preset = addCombo(hwnd, IDC_PRESET, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Preset", L"预设方案", leftX, yLeft, labelW, rowH);
+	g_preset = addCombo(hwnd, IDC_PRESET, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_preset, g_presetItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Rotation", L"旋转", labelX, y, labelW, rowH);
-	g_rotation = addCombo(hwnd, IDC_ROTATION, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Rotation", L"旋转", leftX, yLeft, labelW, rowH);
+	g_rotation = addCombo(hwnd, IDC_ROTATION, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_rotation, g_rotationItems);
-	y += gap;
+	yLeft += gap + 8;
 
-	addLabel(hwnd, L"Super-res scale", L"软件超分倍率", labelX, y, labelW, rowH);
-	g_scale = addCombo(hwnd, IDC_SCALE, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Display", L"显示", leftX, yLeft, labelW + controlW, rowH);
+	yLeft += gap;
+	addLabel(hwnd, L"Super-res scale", L"软件超分倍率", leftX, yLeft, labelW, rowH);
+	g_scale = addCombo(hwnd, IDC_SCALE, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_scale, g_scaleItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"AI super-res", L"AI 超分", labelX, y, labelW, rowH);
-	g_aiSuperres = addCombo(hwnd, IDC_AI_SUPERRES, controlX, y - 2, controlW + 88, 180);
+	addLabel(hwnd, L"AI super-res", L"AI 超分", leftX, yLeft, labelW, rowH);
+	g_aiSuperres = addCombo(hwnd, IDC_AI_SUPERRES, leftControlX, yLeft - 2, controlW + 90, 180);
 	addComboItems(g_aiSuperres, g_aiSuperresItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Interpolation", L"插值算法", labelX, y, labelW, rowH);
-	g_interp = addCombo(hwnd, IDC_INTERP, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Interpolation", L"插值算法", leftX, yLeft, labelW, rowH);
+	g_interp = addCombo(hwnd, IDC_INTERP, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_interp, g_interpItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Colormap", L"伪彩色", labelX, y, labelW, rowH);
-	g_cmap = addCombo(hwnd, IDC_CMAP, controlX, y - 2, controlW, 360);
+	addLabel(hwnd, L"Colormap", L"伪彩色", leftX, yLeft, labelW, rowH);
+	g_cmap = addCombo(hwnd, IDC_CMAP, leftControlX, yLeft - 2, controlW + 90, 360);
 	reloadCmapCombo("4");
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Temperature unit", L"温度单位", labelX, y, labelW, rowH);
-	g_tempUnit = addCombo(hwnd, IDC_TEMP_UNIT, controlX, y - 2, controlW, 120);
+	addLabel(hwnd, L"Temperature unit", L"温度单位", leftX, yLeft, labelW, rowH);
+	g_tempUnit = addCombo(hwnd, IDC_TEMP_UNIT, leftControlX, yLeft - 2, controlW, 120);
 	addComboItems(g_tempUnit, g_tempUnitItems);
-	y += gap;
+	yLeft += gap + 8;
 
-	addLabel(hwnd, L"Temp offset C", L"温度偏移 C", labelX, y, labelW, rowH);
-	g_offset = addEdit(hwnd, IDC_OFFSET, controlX, y - 2, 90, rowH);
-	y += gap;
-
-	addLabel(hwnd, L"Drift C/min", L"温漂 C/分钟", labelX, y, labelW, rowH);
-	g_drift = addEdit(hwnd, IDC_DRIFT, controlX, y - 2, 90, rowH);
-	addLabel(hwnd, L"Default 0", L"默认 0", rightX, y, 92, rowH);
-	y += gap;
-
-	addLabel(hwnd, L"Blackbody target C", L"黑体目标 C", labelX, y, labelW, rowH);
-	g_blackbodyTarget = addEdit(hwnd, IDC_BLACKBODY_TARGET, controlX, y - 2, 90, rowH);
-	g_blackbodyCalibrate = addButton(hwnd, IDC_BLACKBODY_CALIBRATE, L"Calibrate", L"黑体校准", rightX, y - 4, 116, 28);
-	y += gap;
-
-	addLabel(hwnd, L"Blur", L"模糊", labelX, y, labelW, rowH);
-	g_blur = addCombo(hwnd, IDC_BLUR, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Enhancement", L"画质增强", leftX, yLeft, labelW + controlW, rowH);
+	yLeft += gap;
+	addLabel(hwnd, L"Blur", L"模糊", leftX, yLeft, labelW, rowH);
+	g_blur = addCombo(hwnd, IDC_BLUR, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_blur, g_blurItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Contrast / gain", L"对比/增益", labelX, y, labelW, rowH);
-	g_contrast = addCombo(hwnd, IDC_CONTRAST, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Contrast / gain", L"对比/增益", leftX, yLeft, labelW, rowH);
+	g_contrast = addCombo(hwnd, IDC_CONTRAST, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_contrast, g_contrastItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Gaussian filter", L"高斯滤波", labelX, y, labelW, rowH);
-	g_filter = addCombo(hwnd, IDC_FILTER, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Gaussian filter", L"高斯滤波", leftX, yLeft, labelW, rowH);
+	g_filter = addCombo(hwnd, IDC_FILTER, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_filter, g_levelItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Bilateral", L"双边滤波", labelX, y, labelW, rowH);
-	g_bilateral = addCombo(hwnd, IDC_BILATERAL, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Bilateral", L"双边滤波", leftX, yLeft, labelW, rowH);
+	g_bilateral = addCombo(hwnd, IDC_BILATERAL, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_bilateral, g_levelItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Temporal denoise", L"时域降噪", labelX, y, labelW, rowH);
-	g_temporal = addCombo(hwnd, IDC_TEMPORAL, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Temporal denoise", L"时域降噪", leftX, yLeft, labelW, rowH);
+	g_temporal = addCombo(hwnd, IDC_TEMPORAL, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_temporal, g_levelItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Sharpen", L"锐化", labelX, y, labelW, rowH);
-	g_sharpen = addCombo(hwnd, IDC_SHARPEN, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Sharpen", L"锐化", leftX, yLeft, labelW, rowH);
+	g_sharpen = addCombo(hwnd, IDC_SHARPEN, leftControlX, yLeft - 2, controlW, 180);
 	addComboItems(g_sharpen, g_levelItems);
-	y += gap;
+	yLeft += gap;
 
-	addLabel(hwnd, L"Min/max delta C", L"极值阈值 C", labelX, y, labelW, rowH);
-	g_threshold = addEdit(hwnd, IDC_THRESHOLD, controlX, y - 2, 90, rowH);
-	y += gap;
+	addLabel(hwnd, L"Temperature", L"温度校准", rightColX, yRight, labelW + controlW, rowH);
+	yRight += gap;
+	addLabel(hwnd, L"Temp offset C", L"温度偏移 C", rightColX, yRight, labelW, rowH);
+	g_offset = addEdit(hwnd, IDC_OFFSET, rightControlX, yRight - 2, 88, rowH);
+	yRight += gap;
 
-	addLabel(hwnd, L"Auto range", L"自动范围锁定", labelX, y, labelW, rowH);
-	g_autorange = addCombo(hwnd, IDC_AUTORANGE, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Drift C/min", L"温漂 C/分钟", rightColX, yRight, labelW, rowH);
+	g_drift = addEdit(hwnd, IDC_DRIFT, rightControlX, yRight - 2, 88, rowH);
+	addLabel(hwnd, L"Default 0", L"默认 0", rightControlX + 98, yRight, 82, rowH);
+	yRight += gap;
+
+	addLabel(hwnd, L"Blackbody target C", L"黑体目标 C", rightColX, yRight, labelW, rowH);
+	g_blackbodyTarget = addEdit(hwnd, IDC_BLACKBODY_TARGET, rightControlX, yRight - 2, 88, rowH);
+	g_blackbodyCalibrate = addButton(hwnd, IDC_BLACKBODY_CALIBRATE, L"Calibrate", L"黑体校准", rightControlX + 98, yRight - 4, 112, 28);
+	yRight += gap;
+
+	addLabel(hwnd, L"Min/max delta C", L"极值阈值 C", rightColX, yRight, labelW, rowH);
+	g_threshold = addEdit(hwnd, IDC_THRESHOLD, rightControlX, yRight - 2, 88, rowH);
+	yRight += gap;
+
+	addLabel(hwnd, L"Auto range", L"自动范围锁定", rightColX, yRight, labelW, rowH);
+	g_autorange = addCombo(hwnd, IDC_AUTORANGE, rightControlX, yRight - 2, controlW, 180);
 	addComboItems(g_autorange, g_autorangeItems);
-	y += gap;
+	yRight += gap;
 
-	addLabel(hwnd, L"Range mapping", L"范围映射", labelX, y, labelW, rowH);
-	g_mapping = addCombo(hwnd, IDC_MAPPING, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Range mapping", L"范围映射", rightColX, yRight, labelW, rowH);
+	g_mapping = addCombo(hwnd, IDC_MAPPING, rightControlX, yRight - 2, controlW, 180);
 	addComboItems(g_mapping, g_mappingItems);
-	y += gap;
+	yRight += gap;
 
-	g_manualEnable = addCheckbox(hwnd, IDC_MANUAL_ENABLE, L"Manual temp range", L"手动温度范围", controlX, y - 2, 180, rowH);
-	addLabel(hwnd, L"Min / Max C", L"最小/最大 C", rightX, y, 92, rowH);
-	g_manualMin = addEdit(hwnd, IDC_MANUAL_MIN, rightX + 92, y - 2, 54, rowH);
-	g_manualMax = addEdit(hwnd, IDC_MANUAL_MAX, rightX + 152, y - 2, 54, rowH);
-	y += gap;
+	g_manualEnable = addCheckbox(hwnd, IDC_MANUAL_ENABLE, L"Manual temp range", L"手动温度范围", rightColX, yRight - 2, 150, rowH);
+	addLabel(hwnd, L"Min / Max C", L"最小/最大 C", rightControlX, yRight, 82, rowH);
+	g_manualMin = addEdit(hwnd, IDC_MANUAL_MIN, rightControlX + 86, yRight - 2, 52, rowH);
+	g_manualMax = addEdit(hwnd, IDC_MANUAL_MAX, rightControlX + 144, yRight - 2, 52, rowH);
+	yRight += gap + 8;
 
-	addLabel(hwnd, L"ROI mode", L"ROI 模式", labelX, y, labelW, rowH);
-	g_roiMode = addCombo(hwnd, IDC_ROI_MODE, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Analysis", L"分析叠加", rightColX, yRight, labelW + controlW, rowH);
+	yRight += gap;
+	addLabel(hwnd, L"ROI mode", L"ROI 模式", rightColX, yRight, labelW, rowH);
+	g_roiMode = addCombo(hwnd, IDC_ROI_MODE, rightControlX, yRight - 2, 156, 180);
 	addComboItems(g_roiMode, g_roiItems);
-	addLabel(hwnd, L"ROI size", L"ROI 大小", rightX, y, 70, rowH);
-	g_roiSize = addCombo(hwnd, IDC_ROI_SIZE, rightX + 76, y - 2, 130, 160);
+	addLabel(hwnd, L"Size", L"大小", rightControlX + 166, yRight, 38, rowH);
+	g_roiSize = addCombo(hwnd, IDC_ROI_SIZE, rightControlX + 208, yRight - 2, 74, 160);
 	addComboItems(g_roiSize, g_roiSizeItems);
-	y += gap;
+	yRight += gap;
 
-	g_isothermEnable = addCheckbox(hwnd, IDC_ISOTHERM_ENABLE, L"Isotherm / over-temp", L"等温/过温高亮", controlX, y - 2, 180, rowH);
-	addLabel(hwnd, L"Threshold C", L"阈值 C", rightX, y, 92, rowH);
-	g_isothermThreshold = addEdit(hwnd, IDC_ISOTHERM_THRESHOLD, rightX + 92, y - 2, 80, rowH);
-	y += gap;
+	g_isothermEnable = addCheckbox(hwnd, IDC_ISOTHERM_ENABLE, L"Isotherm / over-temp", L"等温/过温高亮", rightColX, yRight - 2, 150, rowH);
+	addLabel(hwnd, L"Threshold C", L"阈值 C", rightControlX, yRight, 82, rowH);
+	g_isothermThreshold = addEdit(hwnd, IDC_ISOTHERM_THRESHOLD, rightControlX + 86, yRight - 2, 74, rowH);
+	yRight += gap;
 
-	g_histogram = addCheckbox(hwnd, IDC_HISTOGRAM, L"Histogram equalize", L"直方图均衡", controlX, y - 2, 180, rowH);
-	g_fullscreen = addCheckbox(hwnd, IDC_FULLSCREEN, L"Fullscreen", L"全屏", rightX, y - 2, 120, rowH);
-	y += gap;
+	g_histogram = addCheckbox(hwnd, IDC_HISTOGRAM, L"Histogram equalize", L"直方图均衡", rightColX, yRight - 2, 150, rowH);
+	g_fullscreen = addCheckbox(hwnd, IDC_FULLSCREEN, L"Fullscreen", L"全屏", rightControlX, yRight - 2, 120, rowH);
+	yRight += gap;
 
-	addLabel(hwnd, L"Rulers", L"标尺", labelX, y, labelW, rowH);
-	g_rulers = addCombo(hwnd, IDC_RULERS, controlX, y - 2, controlW, 180);
+	addLabel(hwnd, L"Rulers", L"标尺", rightColX, yRight, labelW, rowH);
+	g_rulers = addCombo(hwnd, IDC_RULERS, rightControlX, yRight - 2, controlW, 180);
 	addComboItems(g_rulers, g_rulerItems);
-	y += gap + 4;
+	yRight += gap + 8;
 
-	g_start = addButton(hwnd, IDC_START, L"Start", L"启动", controlX, y, 82, 28);
-	g_stop = addButton(hwnd, IDC_STOP, L"Stop", L"停止", controlX + 90, y, 82, 28);
-	g_snapshot = addButton(hwnd, IDC_SNAPSHOT, L"Snapshot", L"截图+RAW", controlX + 180, y, 96, 28);
-	g_record = addButton(hwnd, IDC_RECORD, L"Record", L"录像", controlX + 284, y, 82, 28);
-	y += 36;
+	addLabel(hwnd, L"Actions", L"操作", rightColX, yRight, labelW + controlW, rowH);
+	yRight += gap;
+	g_start = addButton(hwnd, IDC_START, L"Start", L"启动", rightColX, yRight, 82, 28);
+	g_stop = addButton(hwnd, IDC_STOP, L"Stop", L"停止", rightColX + 90, yRight, 82, 28);
+	g_snapshot = addButton(hwnd, IDC_SNAPSHOT, L"Snapshot", L"截图+RAW", rightColX + 180, yRight, 96, 28);
+	g_record = addButton(hwnd, IDC_RECORD, L"Record", L"录像", rightColX + 284, yRight, 82, 28);
+	yRight += 36;
 
-	g_runtimeReset = addButton(hwnd, IDC_RUNTIME_RESET, L"Runtime reset", L"运行中复位", controlX, y, 116, 28);
-	g_resetDefaults = addButton(hwnd, IDC_RESET_DEFAULTS, L"Defaults", L"默认参数", controlX + 126, y, 100, 28);
-	y += 38;
+	g_runtimeReset = addButton(hwnd, IDC_RUNTIME_RESET, L"Runtime reset", L"运行中复位", rightColX, yRight, 116, 28);
+	g_resetDefaults = addButton(hwnd, IDC_RESET_DEFAULTS, L"Defaults", L"默认参数", rightColX + 126, yRight, 100, 28);
+	g_openManual = addButton(hwnd, IDC_OPEN_MANUAL, L"Manual", L"说明书", rightColX + 236, yRight, 100, 28);
+	yRight += 38;
 
-	addLabel(hwnd, L"Command", L"启动命令", labelX, y, labelW, rowH);
+	int commandY = 560;
+	addLabel(hwnd, L"Command", L"启动命令", leftX, commandY, labelW, rowH);
 	g_preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-		controlX, y - 2, 448, 56, hwnd, (HMENU)(INT_PTR)IDC_PREVIEW, NULL, NULL);
+		leftControlX, commandY - 2, 790, 58, hwnd, (HMENU)(INT_PTR)IDC_PREVIEW, NULL, NULL);
 	setFont(g_preview);
-	y += 66;
 
 	g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-		labelX, y, 610, 24, hwnd, (HMENU)(INT_PTR)IDC_STATUS, NULL, NULL);
+		leftX, commandY + 72, 928, 24, hwnd, (HMENU)(INT_PTR)IDC_STATUS, NULL, NULL);
 	setFont(g_status);
 
 	loadSettings();
@@ -1203,6 +1224,34 @@ static void sendBlackbodyCalibration(HWND hwnd) {
 	} else {
 		g_pendingCalibrationId.clear();
 		setStatus(L"Live control pipe is not ready; calibration was not sent.", L"实时控制管道未就绪，校准未发送。");
+	}
+}
+
+static void openManual(HWND hwnd) {
+	std::wstring manual = manualPathW();
+	if ( ! fileExistsW(manual) ) {
+		MessageBoxW(hwnd,
+			g_zh ? L"说明书文件不在启动器旁边。" : L"The manual file was not found next to the launcher.",
+			g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
+			MB_ICONERROR | MB_OK);
+		return;
+	}
+
+	std::wstring commandLine = L"notepad.exe " + quoteArgW(manual);
+	STARTUPINFOW si = {};
+	PROCESS_INFORMATION pi = {};
+	si.cb = sizeof(si);
+	std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+	mutableCommand.push_back(L'\0');
+	if ( CreateProcessW(NULL, mutableCommand.data(), NULL, NULL, FALSE, 0, NULL, exeDirW().c_str(), &si, &pi) ) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		setStatus(L"Manual opened.", L"说明书已打开。");
+	} else {
+		MessageBoxW(hwnd,
+			g_zh ? L"无法打开说明书。" : L"Failed to open the manual.",
+			g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
+			MB_ICONERROR | MB_OK);
 	}
 }
 
@@ -1445,6 +1494,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 				sendBlackbodyCalibration(hwnd);
 				return 0;
 			}
+			if ( id == IDC_OPEN_MANUAL && notify == BN_CLICKED ) {
+				openManual(hwnd);
+				return 0;
+			}
 			if ( id == IDC_RESET_DEFAULTS && notify == BN_CLICKED ) {
 				resetDefaults();
 				saveSettings();
@@ -1544,7 +1597,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR cmdLine, int nCmdShow) 
 
 	HWND hwnd = CreateWindowExW(0, wc.lpszClassName, g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
 		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-		CW_USEDEFAULT, CW_USEDEFAULT, 660, 1024,
+		CW_USEDEFAULT, CW_USEDEFAULT, 980, 720,
 		NULL, NULL, hInstance, NULL);
 	if ( ! hwnd ) {
 		return 1;
