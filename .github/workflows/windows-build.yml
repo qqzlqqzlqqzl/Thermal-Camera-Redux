@@ -231,6 +231,9 @@ jobs:
           if (-not (Select-String -LiteralPath .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md -SimpleMatch '黑体校准' -Quiet)) {
             throw 'GUI manual does not document blackbody calibration'
           }
+          if (-not (Select-String -LiteralPath .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md -SimpleMatch '定时连拍' -Quiet)) {
+            throw 'GUI manual does not document timelapse capture'
+          }
           if (-not $acceptedHelpExit) {
             $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
             if (Test-Path $toolchainBin) {

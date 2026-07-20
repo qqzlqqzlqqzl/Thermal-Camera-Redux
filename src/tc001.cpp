@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <pthread.h>
 #include <chrono>
@@ -25,6 +26,7 @@
 #endif
 #include <windows.h>
 #include <io.h>
+#include <direct.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -274,6 +276,11 @@ static int takeRecording    = 0;
 const char *snapshotPrefix  = "";
 const char *recordingPrefix = "";
 static std::string controlPipeName;
+static bool timelapseActive = false;
+static double timelapseIntervalSeconds = 10.0;
+static int64_t timelapseNextCaptureMillis = 0;
+static unsigned long timelapseSequence = 0;
+static std::string timelapseOutputDir;
 
 // AlphaNumeric or '-' or '_', NOT starting with '-'
 int validatePrefix( const char *prefix ) {
@@ -4036,15 +4043,38 @@ FILE * readRawFrame(Mat &frame, const char *filename, FILE *fp, int keepOpen, lo
 }
 
 
+static bool writeSnapshotFiles( Mat *frame, const std::string &prefix, bool saveRaw ) {
+	if ( 0x00 == frame || frame->empty() || prefix.empty() ) {
+		return false;
+	}
+
+	std::string filename = prefix + ".png";
+	try {
+		if ( ! imwrite(filename, *frame) ) {
+			printf("Snapshot write failed: %s\n", filename.c_str());
+			FF();
+			return false;
+		}
+	} catch ( const cv::Exception &error ) {
+		printf("Snapshot write failed: %s (%s)\n", filename.c_str(), error.what());
+		FF();
+		return false;
+	}
+
+	if ( saveRaw ) {
+		std::string rawname = prefix + ".raw";
+		writeRawFrame( *threadData.rawFrame, rawname.c_str(), 0, 0 );
+	}
+	return true;
+}
+
 void snapshot( Mat *frame, const char *prefix ) {
 
 	//size_t strftime (char* ptr, size_t maxsize, const char* format, const struct tm* timeptr );
 	time_t rawtime;
 	struct tm * timeinfo;
 	char now [128];
-#define FN_SIZE 256
-	char filename[FN_SIZE];
-	char rawname[FN_SIZE];
+	std::string snapshotBase;
 
 	time (&rawtime);
 	timeinfo = localtime (&rawtime);
@@ -4053,26 +4083,127 @@ void snapshot( Mat *frame, const char *prefix ) {
 	strftime (controls.snaptime, sizeof(controls.snaptime), "%H:%M:%S", timeinfo);
 
 	if ( validatePrefix( prefix ) ) {
-#define MAX_PREFIX (FN_SIZE - (sizeof(".png") + 1))
-		// Make RPi compiler happy
-		strncpy( filename, prefix, MAX_PREFIX );
-		strncpy( rawname,  prefix, MAX_PREFIX );
-		filename[ MAX_PREFIX ] = 0x00;
-		rawname[  MAX_PREFIX ] = 0x00;
-		strcat( filename, ".png");
-		strcat( rawname,  ".raw");
+		snapshotBase = prefix;
 	} else {
-		sprintf(filename, "TC001%s.png", now);
-		sprintf(rawname,  "TC001%s.raw", now);
+		snapshotBase = std::string("TC001") + now;
 	}
 
 	printf("%s", GREEN_STR() );
-	//now(20231115-010012), filename(TC00120231115-010012.png), snaptime(01:00:12)
-	printf("\nnow(%s), filename(%s), snaptime(%s)\n\n", now,filename,controls.snaptime);
+	printf("\nnow(%s), filename(%s.png), snaptime(%s)\n\n", now,snapshotBase.c_str(),controls.snaptime);
 	printf("%s", RESET_STR() );
 
-	imwrite(filename, *frame);
-	writeRawFrame( *threadData.rawFrame, rawname, 0, 0 );
+	writeSnapshotFiles( frame, snapshotBase, true );
+}
+
+static bool makeDirectoryIfMissing( const std::string &path ) {
+	if ( path.empty() ) {
+		return false;
+	}
+#ifdef _WIN32
+	int result = _mkdir( path.c_str() );
+#else
+	int result = mkdir( path.c_str(), 0755 );
+#endif
+	if ( 0 == result ) {
+		return true;
+	}
+	if ( EEXIST != errno ) {
+		return false;
+	}
+	struct stat info;
+	return 0 == stat(path.c_str(), &info) && 0 != (info.st_mode & S_IFDIR);
+}
+
+static std::string defaultTimelapseSessionName() {
+	time_t rawtime;
+	struct tm *timeinfo;
+	char now[64];
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	strftime(now, sizeof(now), "session-%Y%m%d-%H%M%S", timeinfo);
+	return std::string(now);
+}
+
+static bool startTimelapse( double intervalSeconds, const std::string &requestedSession ) {
+	if ( intervalSeconds < 1.0 || intervalSeconds > 86400.0 ) {
+		printf("Timelapse status=error reason=bad-interval interval_s=%.3f\n", intervalSeconds);
+		FF();
+		return false;
+	}
+
+	std::string session = requestedSession.empty() ? defaultTimelapseSessionName() : requestedSession;
+	if ( ! validatePrefix(session.c_str()) ) {
+		printf("Timelapse status=error reason=bad-session session=%s\n", session.c_str());
+		FF();
+		return false;
+	}
+
+	if ( ! makeDirectoryIfMissing("timelapse") ) {
+		printf("Timelapse status=error reason=create-root-failed output_dir=timelapse\n");
+		FF();
+		return false;
+	}
+
+	std::string outputDir = std::string("timelapse/") + session;
+	if ( ! makeDirectoryIfMissing(outputDir) ) {
+		printf("Timelapse status=error reason=create-session-failed output_dir=%s\n", outputDir.c_str());
+		FF();
+		return false;
+	}
+
+	timelapseIntervalSeconds = intervalSeconds;
+	timelapseOutputDir = outputDir;
+	timelapseSequence = 0;
+	timelapseNextCaptureMillis = 0;
+	timelapseActive = true;
+	printf("Timelapse status=started interval_s=%.3f output_dir=%s\n",
+		timelapseIntervalSeconds, timelapseOutputDir.c_str());
+	FF();
+	return true;
+}
+
+static void stopTimelapse() {
+	if ( timelapseActive ) {
+		printf("Timelapse status=stopped frames=%lu output_dir=%s\n",
+			timelapseSequence, timelapseOutputDir.c_str());
+		FF();
+	}
+	timelapseActive = false;
+	timelapseNextCaptureMillis = 0;
+}
+
+static void captureTimelapseFrameIfDue( Mat *frame ) {
+	if ( ! timelapseActive ) {
+		return;
+	}
+
+	int64_t nowMillis = currentTimeMillis();
+	if ( timelapseNextCaptureMillis > 0 && nowMillis < timelapseNextCaptureMillis ) {
+		return;
+	}
+
+	time_t rawtime;
+	struct tm *timeinfo;
+	char now[64];
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	strftime(now, sizeof(now), "%Y%m%d-%H%M%S", timeinfo);
+
+	timelapseSequence++;
+	char sequence[32];
+	snprintf(sequence, sizeof(sequence), "%06lu", timelapseSequence);
+	std::string prefix = timelapseOutputDir + "/thermal-" + now + "-" + sequence;
+	if ( writeSnapshotFiles(frame, prefix, false) ) {
+		printf("Timelapse status=frame sequence=%lu timestamp=%s file=%s.png\n",
+			timelapseSequence, now, prefix.c_str());
+		FF();
+		timelapseNextCaptureMillis = nowMillis + (int64_t)(timelapseIntervalSeconds * 1000.0);
+	} else {
+		printf("Timelapse status=error reason=snapshot-write-failed sequence=%lu file=%s.png\n",
+			timelapseSequence, prefix.c_str());
+		FF();
+		stopTimelapse();
+	}
 }
 
 void rotateDisplay( ProcessedThermalFrame *ptf, int rotate ) {
@@ -4108,6 +4239,7 @@ void printUsage() {
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
   printf( "                 [-control-pipe name] for live Windows GUI controls\n");
   printf( "                 live control: calibrate blackbody targetC [roiPercent] [requestId]\n");
+  printf( "                 live control: timelapse start intervalSeconds [sessionName] | timelapse stop\n");
   printf( "                 [-perf-frames n] [-benchmark-frames n] for deterministic CLI performance tests\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
@@ -7050,6 +7182,37 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 		threadData.configurationChanged++;
 		return;
 	}
+	if ( command == "timelapse" || command == "time-lapse" || command == "interval-capture" ) {
+		std::string action;
+		iss >> action;
+		action = lowerControlString( action );
+		if ( action == "stop" || action == "off" ) {
+			stopTimelapse();
+			return;
+		}
+		if ( action == "start" || action == "on" ) {
+			std::string intervalText;
+			std::string session;
+			if ( ! (iss >> intervalText) ) {
+				printf("Timelapse status=error reason=missing-interval\n");
+				FF();
+				return;
+			}
+			iss >> session;
+			char *intervalEnd = 0x00;
+			double intervalSeconds = strtod(intervalText.c_str(), &intervalEnd);
+			if ( intervalEnd == intervalText.c_str() || '\0' != *intervalEnd ) {
+				printf("Timelapse status=error reason=bad-interval interval=%s\n", intervalText.c_str());
+				FF();
+				return;
+			}
+			startTimelapse(intervalSeconds, trimControlString(session));
+			return;
+		}
+		printf("Timelapse status=error reason=bad-action action=%s\n", action.c_str());
+		FF();
+		return;
+	}
 	if ( command == "record" ) {
 		recording( ptf, 0 );
 		threadData.configurationChanged++;
@@ -8061,6 +8224,13 @@ int mainPrivate (int argc, char *argv[]) {
 			if ( ! threadData.running ) {
 				break;
 			}
+			captureTimelapseFrameIfDue(
+#if BORDER_LAYOUT
+				&borderFrame
+#else
+				&rgbFrame
+#endif
+			);
 
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );

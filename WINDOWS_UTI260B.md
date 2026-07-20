@@ -168,6 +168,25 @@ Thermal-Camera-Redux.exe ... -control-pipe <pipe-name>
 This is normally managed by `Thermal-Camera-Redux-GUI.exe`; direct users do not
 need to create the pipe manually.
 
+The GUI also exposes interval/timelapse capture:
+
+- Set an interval from 1 to 86400 seconds.
+- `Start timelapse` captures the first displayed frame immediately, then keeps
+  capturing at the selected interval.
+- `Stop timelapse` stops timed capture without closing the camera.
+- Each run creates `timelapse/session-YYYYMMDD-HHMMSS-id` next to the
+  executable.
+- Files are PNG-only and use
+  `thermal-YYYYMMDD-HHMMSS-000001.png` style names. Manual `Snapshot` continues
+  to save both PNG and RAW.
+
+The corresponding live-control commands are:
+
+```text
+timelapse start <intervalSeconds> [sessionName]
+timelapse stop
+```
+
 The tested Windows device list was:
 
 - `USB Camera`: `USB\VID_0BDA&PID_3901&MI_00\...`

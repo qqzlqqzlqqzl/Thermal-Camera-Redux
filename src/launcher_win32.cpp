@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <iomanip>
 #include <cstring>
 #include <cstdlib>
 
@@ -64,6 +65,10 @@ static const int IDC_AI_SUPERRES = 1037;
 static const int IDC_BLACKBODY_TARGET = 1038;
 static const int IDC_BLACKBODY_CALIBRATE = 1039;
 static const int IDC_OPEN_MANUAL = 1040;
+static const int IDC_TIMELAPSE_INTERVAL = 1041;
+static const int IDC_TIMELAPSE_START = 1042;
+static const int IDC_TIMELAPSE_STOP = 1043;
+static const int IDC_TIMELAPSE_FOLDER = 1044;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -96,6 +101,10 @@ static HWND g_record;
 static HWND g_runtimeReset;
 static HWND g_resetDefaults;
 static HWND g_openManual;
+static HWND g_timelapseInterval;
+static HWND g_timelapseStart;
+static HWND g_timelapseStop;
+static HWND g_timelapseFolder;
 static HWND g_preset;
 static HWND g_blur;
 static HWND g_contrast;
@@ -124,6 +133,8 @@ static DWORD g_processId = 0;
 static std::string g_pipeName;
 static std::string g_pendingCalibrationId;
 static int g_calibrationPolls = 0;
+static bool g_timelapseActive = false;
+static std::wstring g_timelapseOutputFolder;
 
 static std::vector<ComboItem> g_languageItems = {
 	{ L"中文", L"中文", "zh-CN" },
@@ -246,8 +257,11 @@ static std::string utf8FromWide(const std::wstring &value) {
 	if ( bytes <= 0 ) {
 		return std::string();
 	}
-	std::string result((size_t)bytes - 1, '\0');
-	WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], bytes, NULL, NULL);
+	std::string result((size_t)bytes, '\0');
+	if ( WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, &result[0], bytes, NULL, NULL) <= 0 ) {
+		return std::string();
+	}
+	result.resize((size_t)bytes - 1);
 	return result;
 }
 
@@ -276,6 +290,18 @@ static std::wstring joinPathW(const std::wstring &dir, const std::wstring &name)
 static bool fileExistsW(const std::wstring &path) {
 	DWORD attrs = GetFileAttributesW(path.c_str());
 	return attrs != INVALID_FILE_ATTRIBUTES && 0 == (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool directoryExistsW(const std::wstring &path) {
+	DWORD attrs = GetFileAttributesW(path.c_str());
+	return attrs != INVALID_FILE_ATTRIBUTES && 0 != (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool createDirectoryIfMissingW(const std::wstring &path) {
+	if ( CreateDirectoryW(path.c_str(), NULL) ) {
+		return true;
+	}
+	return ERROR_ALREADY_EXISTS == GetLastError() && directoryExistsW(path);
 }
 
 static std::wstring quoteArgW(const std::wstring &arg) {
@@ -728,6 +754,7 @@ static void saveSettings() {
 	writeIni("isotherm_threshold_c", textOfAscii(g_isothermThreshold));
 	writeIni("histogram", boolValue(g_histogram));
 	writeIni("rulers", comboValue(g_rulers, g_rulerItems));
+	writeIni("timelapse_interval_s", textOfAscii(g_timelapseInterval));
 }
 
 static void applyLanguageToUi() {
@@ -792,6 +819,7 @@ static void resetDefaults() {
 	setText(g_isothermThreshold, L"60.0");
 	setChecked(g_histogram, false);
 	selectComboByValue(g_rulers, g_rulerItems, "0", 0);
+	setText(g_timelapseInterval, L"10");
 	g_suppressEvents = false;
 	updatePreview();
 }
@@ -830,6 +858,7 @@ static void loadSettings() {
 	setText(g_isothermThreshold, widenAscii(readIni("isotherm_threshold_c", "60.0")));
 	setChecked(g_histogram, readIni("histogram", "0") == "1");
 	selectComboByValue(g_rulers, g_rulerItems, readIni("rulers", "0"), 0);
+	setText(g_timelapseInterval, widenAscii(readIni("timelapse_interval_s", "10")));
 	g_suppressEvents = false;
 	applyLanguageToUi();
 }
@@ -1041,6 +1070,13 @@ static void createControls(HWND hwnd) {
 	g_openManual = addButton(hwnd, IDC_OPEN_MANUAL, L"Manual", L"说明书", rightColX + 236, yRight, 100, 28);
 	yRight += 38;
 
+	addLabel(hwnd, L"Timelapse seconds", L"连拍间隔秒", rightColX, yRight, 108, rowH);
+	g_timelapseInterval = addEdit(hwnd, IDC_TIMELAPSE_INTERVAL, rightColX + 112, yRight - 2, 58, rowH);
+	g_timelapseStart = addButton(hwnd, IDC_TIMELAPSE_START, L"Start", L"开始连拍", rightColX + 178, yRight - 4, 88, 28);
+	g_timelapseStop = addButton(hwnd, IDC_TIMELAPSE_STOP, L"Stop", L"停止连拍", rightColX + 274, yRight - 4, 88, 28);
+	g_timelapseFolder = addButton(hwnd, IDC_TIMELAPSE_FOLDER, L"Folder", L"打开目录", rightColX + 370, yRight - 4, 88, 28);
+	EnableWindow(g_timelapseStop, FALSE);
+
 	int commandY = 560;
 	addLabel(hwnd, L"Command", L"启动命令", leftX, commandY, labelW, rowH);
 	g_preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
@@ -1132,6 +1168,9 @@ static void terminateCameraProcess() {
 		g_process = NULL;
 		g_processId = 0;
 		g_pipeName.clear();
+		g_timelapseActive = false;
+		EnableWindow(g_timelapseStart, TRUE);
+		EnableWindow(g_timelapseStop, FALSE);
 		updatePreview();
 	}
 }
@@ -1250,6 +1289,135 @@ static void openManual(HWND hwnd) {
 	} else {
 		MessageBoxW(hwnd,
 			g_zh ? L"无法打开说明书。" : L"Failed to open the manual.",
+			g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
+			MB_ICONERROR | MB_OK);
+	}
+}
+
+static bool createTimelapseSession(std::string &sessionName, std::wstring &outputFolder) {
+	std::wstring root = joinPathW(exeDirW(), L"timelapse");
+	if ( ! createDirectoryIfMissingW(root) ) {
+		return false;
+	}
+
+	SYSTEMTIME now = {};
+	GetLocalTime(&now);
+	for (int attempt = 0; attempt < 100; attempt++) {
+		std::wostringstream name;
+		name << L"session-"
+		     << std::setfill(L'0') << std::setw(4) << now.wYear
+		     << std::setw(2) << now.wMonth
+		     << std::setw(2) << now.wDay
+		     << L"-"
+		     << std::setw(2) << now.wHour
+		     << std::setw(2) << now.wMinute
+		     << std::setw(2) << now.wSecond
+		     << L"-"
+		     << std::setw(5) << ((GetTickCount64() + attempt) % 100000);
+		std::wstring candidateName = name.str();
+		std::wstring candidatePath = joinPathW(root, candidateName);
+		if ( CreateDirectoryW(candidatePath.c_str(), NULL) ) {
+			sessionName = narrowAscii(candidateName);
+			outputFolder = candidatePath;
+			return true;
+		}
+		if ( ERROR_ALREADY_EXISTS != GetLastError() ) {
+			return false;
+		}
+	}
+	return false;
+}
+
+static void startTimelapse() {
+	if ( ! isProcessRunning() ) {
+		setStatus(L"Start the camera before timelapse capture.", L"请先启动相机再开始连拍。");
+		return;
+	}
+	if ( ! looksNumeric(g_timelapseInterval) ) {
+		setStatus(L"Timelapse interval is not numeric.", L"连拍间隔不是数字。");
+		return;
+	}
+
+	std::string intervalText = textOfAscii(g_timelapseInterval);
+	char *intervalEnd = NULL;
+	double intervalSeconds = std::strtod(intervalText.c_str(), &intervalEnd);
+	if ( intervalEnd == intervalText.c_str() || '\0' != *intervalEnd ||
+	     intervalSeconds < 1.0 || intervalSeconds > 86400.0 ) {
+		setStatus(L"Timelapse interval must be 1 to 86400 seconds.", L"连拍间隔必须是 1 到 86400 秒。");
+		return;
+	}
+	if ( ! ensureControlPipeOpen() ) {
+		return;
+	}
+
+	std::string sessionName;
+	std::wstring outputFolder;
+	if ( ! createTimelapseSession(sessionName, outputFolder) ) {
+		setStatus(L"Failed to create the timelapse output folder.", L"无法创建连拍输出目录。");
+		return;
+	}
+
+	std::ostringstream command;
+	command << "timelapse start " << intervalText << " " << sessionName << "\n";
+	if ( ! sendControlText(command.str()) ) {
+		setStatus(L"Failed to send the timelapse start command.", L"发送开始连拍命令失败。");
+		return;
+	}
+
+	g_timelapseActive = true;
+	g_timelapseOutputFolder = outputFolder;
+	EnableWindow(g_timelapseStart, FALSE);
+	EnableWindow(g_timelapseStop, TRUE);
+	saveSettings();
+
+	std::wostringstream en;
+	en << L"Timelapse started every " << widenAscii(intervalText) << L" s: " << outputFolder;
+	std::wostringstream zh;
+	zh << L"已开始连拍，每 " << widenAscii(intervalText) << L" 秒一张：" << outputFolder;
+	setDynamicStatus(en.str(), zh.str());
+}
+
+static void stopTimelapse() {
+	if ( ! g_timelapseActive ) {
+		setStatus(L"Timelapse is not running.", L"当前没有在连拍。");
+		return;
+	}
+	if ( sendControlText("timelapse stop\n") ) {
+		g_timelapseActive = false;
+		EnableWindow(g_timelapseStart, TRUE);
+		EnableWindow(g_timelapseStop, FALSE);
+		std::wostringstream en;
+		en << L"Timelapse stopped. Files: " << g_timelapseOutputFolder;
+		std::wostringstream zh;
+		zh << L"连拍已停止，文件位于：" << g_timelapseOutputFolder;
+		setDynamicStatus(en.str(), zh.str());
+	}
+}
+
+static void openTimelapseFolder(HWND hwnd) {
+	std::wstring folder = g_timelapseOutputFolder.empty()
+		? joinPathW(exeDirW(), L"timelapse")
+		: g_timelapseOutputFolder;
+	if ( ! createDirectoryIfMissingW(folder) ) {
+		MessageBoxW(hwnd,
+			g_zh ? L"无法创建或打开连拍目录。" : L"Failed to create or open the timelapse folder.",
+			g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
+			MB_ICONERROR | MB_OK);
+		return;
+	}
+
+	std::wstring commandLine = L"explorer.exe " + quoteArgW(folder);
+	STARTUPINFOW si = {};
+	PROCESS_INFORMATION pi = {};
+	si.cb = sizeof(si);
+	std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+	mutableCommand.push_back(L'\0');
+	if ( CreateProcessW(NULL, mutableCommand.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, exeDirW().c_str(), &si, &pi) ) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	} else {
+		MessageBoxW(hwnd,
+			g_zh ? L"无法打开连拍目录。" : L"Failed to open the timelapse folder.",
 			g_zh ? APP_TITLE_ZH : APP_TITLE_EN,
 			MB_ICONERROR | MB_OK);
 	}
@@ -1408,6 +1576,9 @@ static void launchCamera(HWND hwnd) {
 	CloseHandle(pi.hThread);
 	g_process = pi.hProcess;
 	g_processId = pi.dwProcessId;
+	g_timelapseActive = false;
+	EnableWindow(g_timelapseStart, TRUE);
+	EnableWindow(g_timelapseStop, FALSE);
 	SetTimer(hwnd, TIMER_PROCESS, 1000, NULL);
 	SetTimer(hwnd, TIMER_INITIAL_SYNC, 900, NULL);
 	setStatus(L"Started. Live controls will sync shortly.", L"已启动，实时控制即将同步。");
@@ -1419,6 +1590,9 @@ static void stopCamera() {
 		return;
 	}
 	if ( sendControlText("quit\n") ) {
+		g_timelapseActive = false;
+		EnableWindow(g_timelapseStart, TRUE);
+		EnableWindow(g_timelapseStop, FALSE);
 		if ( WAIT_TIMEOUT == WaitForSingleObject(g_process, 1500) ) {
 			setStatus(L"Stop command sent; waiting for exit.", L"已发送停止命令，等待退出。");
 		} else {
@@ -1447,6 +1621,9 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 					KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
 					g_pendingCalibrationId.clear();
 					g_pipeName.clear();
+					g_timelapseActive = false;
+					EnableWindow(g_timelapseStart, TRUE);
+					EnableWindow(g_timelapseStop, FALSE);
 					updatePreview();
 					setStatus(L"Process exited.", L"进程已退出。");
 				}
@@ -1480,6 +1657,18 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			}
 			if ( id == IDC_SNAPSHOT && notify == BN_CLICKED ) {
 				sendLiveCommand("snapshot");
+				return 0;
+			}
+			if ( id == IDC_TIMELAPSE_START && notify == BN_CLICKED ) {
+				startTimelapse();
+				return 0;
+			}
+			if ( id == IDC_TIMELAPSE_STOP && notify == BN_CLICKED ) {
+				stopTimelapse();
+				return 0;
+			}
+			if ( id == IDC_TIMELAPSE_FOLDER && notify == BN_CLICKED ) {
+				openTimelapseFolder(hwnd);
 				return 0;
 			}
 			if ( id == IDC_RECORD && notify == BN_CLICKED ) {
@@ -1538,6 +1727,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 		}
 		case WM_DESTROY:
 			KillTimer(hwnd, TIMER_CALIBRATION_STATUS);
+			g_timelapseActive = false;
 			saveSettings();
 			if ( isProcessRunning() ) {
 				if ( ! sendControlText("quit\n") || WAIT_TIMEOUT == WaitForSingleObject(g_process, 1200) ) {
