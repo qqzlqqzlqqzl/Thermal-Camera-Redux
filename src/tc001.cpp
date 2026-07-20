@@ -2546,7 +2546,9 @@ void resetDefaults() {
 
 	resetLockAutoRanging();
 
-	controls.hud          = HUD_HUD;
+	// Keep the thermal image unobstructed by default. The compact HUD remains
+	// available through the existing "h" display-mode cycle.
+	controls.hud          = HUD_OFF;
 
 	controls.inters       = 2; // INTER_CUBIC
 	controls.useCelsius   = Use_Celsius = USE_CELSIUS;
@@ -2583,9 +2585,9 @@ static int HelpWidth       = TC_WIDTH;
 static int HelpHeight      = TC_HEIGHT; 
 
 #define MAX_HELP_TEXT_ROWS (20 + 1)  // Was (24 + 1)
-#define MAX_HUD_TEXT_ROWS  ( 9 + 1)
+#define MAX_HUD_TEXT_ROWS  ( 3 + 1)
 
-const char * LONGEST_HUD_STRING  = "Flt:Medium B:Medium T:Medium S:Strong";
+const char * LONGEST_HUD_STRING  = "FPS:999.9 Off:+999.9 D:+99.99";
 const char * LONGEST_HELP_STRING = "L mb: Add temps, mv rulers ";
 
 #define MAX_SCALE_FOR_FONT 5.0
@@ -4863,6 +4865,8 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 {
 	char buf[256];
 	const char *labelCF = controls.labelCF;
+	(void)src;
+	(void)srcColor;
 
 	float yOffset = 1.4 * (float) hudSpaceSize.height;
 	float yDelta  = (float)HudHeight / (float)MAX_HUD_TEXT_ROWS;
@@ -4876,63 +4880,55 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, HudWidth, HudHeight );
 	rectangle(rgbHUD, PointZeroZero, hudPoint, BLACK, -1);
 
-	// put text in the box
+	// Keep the optional HUD compact: measurement summary, display pipeline,
+	// and live performance/calibration state only.
 	POINT( hudPoint, L_X, Y(0) );
-	putText(rgbHUD, tempStr(buf,"Avg Temp: ", ptf->avg, labelCF), hudPoint,
-	Default_Font, HudFontScale, WHITE, 1, hudLineType);
+	snprintf(buf, sizeof(buf), "Avg: %.1f%s Map:%s%s",
+		CorF(ptf->avg.celsius), labelCF,
+		cmaps[controls.cmapCurrent]->name, Use_Histogram ? "+Hist" : "");
+	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, WHITE, 1, hudLineType);
 
-	// Threshold is a [0-N] delta in degrees, not a temp
+	snprintf(buf, sizeof(buf), "SR:%dx %s AI:%s",
+		MyScale, Inters[controls.inters].name, aiSuperResHudStatus());
 	POINT( hudPoint, L_X, Y(1) );
-	putText(rgbHUD, tempStr(buf,"Threshold: ", controls.threshold.celsius,labelCF), hudPoint,
-	Default_Font, HudFontScale, WHITE, 1, hudLineType);
-
-	//sprintf(buf, "Colormap: %s", cmaps[controls.cmapCurrent].name);
-	sprintf(buf, "Map: %s%s", cmaps[controls.cmapCurrent]->name, Use_Histogram?"+Hist":"");
-	POINT( hudPoint, L_X, Y(2) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
-
-	sprintf(buf, "SR:%dx %s AI:%s B:%d",
-		MyScale, Inters[controls.inters].name,
-		aiSuperResHudStatus(), controls.rad);
-	POINT( hudPoint, L_X, Y(3) );
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
-
- 	//sprintf(buf, "Scale: %d  Src: %s", MyScale, src );
- 	sprintf(buf, "Scale: %d  Src: ", MyScale ); // Add Source error color
-
-	// Get width offset to display src in srcColor
-	int baseline;
-	Size ts = getTextSize(buf, Default_Font, HudFontScale, 1, &baseline);
-
-	POINT( hudPoint, L_X, Y(4) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW,   1, hudLineType);
-	POINT( hudPoint, L_X+ts.width, Y(4) );
-	putText(rgbHUD, src, hudPoint, Default_Font, HudFontScale, srcColor, 1, hudLineType);
-
-	sprintf(buf, "Flt:%s B:%s T:%s S:%s",
-		displayLevelShortName(controls.displayFilterPreset),
-		displayLevelShortName(controls.bilateralLevel),
-		displayLevelShortName(controls.temporalDenoiseLevel),
-		displayLevelShortName(controls.sharpenLevel));
-	POINT( hudPoint, L_X, Y(5) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
-
-	sprintf(buf, "Snapshot: %s", controls.snaptime);
-	POINT( hudPoint, L_X, Y(6) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
-
-      	sprintf(buf, "Recording: %s", controls.elapsed);
-	POINT( hudPoint, L_X, Y(7) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, *ptf->rColor, 1, hudLineType);
 
 	if ( 0.0 != temperatureOffsetCelsius || 0.0f != temperatureDriftCelsiusPerMinute ) {
-		sprintf(buf, "FPS: %.1f  %s Off:%+.1f D:%+.2f", controls.fps, controls.labelWF,
+		snprintf(buf, sizeof(buf), "FPS:%.1f Off:%+.1f D:%+.2f", controls.fps,
 			temperatureOffsetCelsius, temperatureDriftCelsiusPerMinute);
 	} else {
-		sprintf(buf, "FPS: %.1f  %s", controls.fps, controls.labelWF);
+		snprintf(buf, sizeof(buf), "FPS:%.1f", controls.fps);
 	}
-	POINT( hudPoint, L_X, Y(8) ); 
+	POINT( hudPoint, L_X, Y(2) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+}
+
+static void blendDisplayOsd( Mat &frame ) {
+	if ( frame.empty() || threadData.rgbHUD.empty() ) {
+		return;
+	}
+
+	Rect roi;
+	roi.x = roi.y = 0;
+	if ( HUD_HELP == controls.hud ) {
+		roi.width  = min( HelpWidth,  SCALED_TC_WIDTH  );
+		roi.height = min( HelpHeight, SCALED_TC_HEIGHT );
+	} else if ( HUD_HUD == controls.hud ) {
+		roi.width  = min( HudWidth,  SCALED_TC_WIDTH  );
+		roi.height = min( HudHeight, SCALED_TC_HEIGHT );
+	} else {
+		return;
+	}
+
+	roi.width  = min( roi.width,  frame.cols );
+	roi.height = min( roi.height, frame.rows );
+	if ( roi.width <= 0 || roi.height <= 0 ) {
+		return;
+	}
+
+	Mat frameROI = frame( roi );
+	Mat hudROI = threadData.rgbHUD( Rect(0, 0, roi.width, roi.height) );
+	addWeighted( frameROI, 1-HUD_ALPHA, hudROI, HUD_ALPHA, 0.0, frameROI );
 }
 
 static Rect displayPaneRect( Mat &frame ) {
@@ -5419,37 +5415,6 @@ void drawUserAndRulerTemps( int horizontal ) {
 	if ( drawMin ) { drawTempMarker( *threadData.rgbFrame, ptf->min, BLUE ); }
 
 #if ! BORDER_LAYOUT
-		try {
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) 
-			{
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) 
-			{
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
-		} catch (...) {
-			controls.lastHelpScale = -1; // trigger Help to be redrawn
-			printf("%s(%d) - HUD exception (%d)\n", __func__, __LINE__, horizontal); 
-			FF();
-		}
-
 	//	try {
 			{ // Draw opaque Colormap Gradient Scale
 				// Reversed from Mat cmapScale(width,height)
@@ -5583,38 +5548,6 @@ void drawUserAndRulerTemps( int horizontal ) {
 #endif
 
 		if ( drawMin ) { drawTempMarker( *threadData.rgbFrame, ptf->min, BLUE ); }
-
-#if ! BORDER_LAYOUT
-		try {
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) {
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) {
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
-		} 
-		catch (...) {
-			controls.lastHelpScale = -1; // trigger Help to be redrawn
-			printf("%s(%d) - HUD exception (%d)\n", __func__, __LINE__, horizontal); 
-			FF();
-		}
-#endif
 
 	} else {
 		// Top and bottom 2 of vertical
@@ -8039,6 +7972,9 @@ int mainPrivate (int argc, char *argv[]) {
 	//printf("%s(%d) - Parallel worker threads finished %ld\n", __func__, __LINE__, currentTimeMicros()); FF();
 
 			TS( int64_t imshowMicros = currentTimeMicros(); )
+			Mat osdDisplayFrame;
+			Mat *cleanCaptureFrame = &rgbFrame;
+			Mat *displayOutputFrame = &rgbFrame;
 
 			if ( HUD_ONLY_VIDEO != controls.hud ) {
 				pthread_mutex_lock( &videoOutMutex );
@@ -8059,29 +7995,6 @@ int mainPrivate (int argc, char *argv[]) {
 			// Remove right border when double wide since cmap is over thermal window
 			// Squishy right border
 			copyMakeBorder( rgbFrame, borderFrame, 0, 0, leftBorderWidth, rightBorderWidth, BORDER_CONSTANT, 0 );
-
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) {
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = borderFrame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) {
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = borderFrame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
 
 			if ( HUD_ONLY_VIDEO != controls.hud ) {
 				{ // Draw opaque Colormap Gradient Scale
@@ -8119,13 +8032,26 @@ int mainPrivate (int argc, char *argv[]) {
 
 			pthread_mutex_unlock( &videoOutMutex );
 
-			writeRecordingFrame( ptf, borderFrame );
-			imshow( WINDOW_NAME, borderFrame );
+			cleanCaptureFrame = &borderFrame;
+			displayOutputFrame = cleanCaptureFrame;
+			if ( HUD_HELP == controls.hud || HUD_HUD == controls.hud ) {
+				osdDisplayFrame = borderFrame.clone();
+				blendDisplayOsd( osdDisplayFrame );
+				displayOutputFrame = &osdDisplayFrame;
+			}
+
+			writeRecordingFrame( ptf, *displayOutputFrame );
+			imshow( WINDOW_NAME, *displayOutputFrame );
 		}
 
 #else
-		writeRecordingFrame( ptf, rgbFrame );
-		imshow( WINDOW_NAME, rgbFrame );
+		if ( HUD_HELP == controls.hud || HUD_HUD == controls.hud ) {
+			osdDisplayFrame = rgbFrame.clone();
+			blendDisplayOsd( osdDisplayFrame );
+			displayOutputFrame = &osdDisplayFrame;
+		}
+		writeRecordingFrame( ptf, *displayOutputFrame );
+		imshow( WINDOW_NAME, *displayOutputFrame );
 #endif
 
 		TS( threadData.imshowMicros += ( currentTimeMicros() - imshowMicros ); ) // track relative benchmarks
@@ -8216,30 +8142,16 @@ int mainPrivate (int argc, char *argv[]) {
 			int c = (char)waitKeyEx( 1 );
 #endif
 
-#if BORDER_LAYOUT
-			pollRuntimeControlPipe( ptf, &borderFrame );
-#else
-			pollRuntimeControlPipe( ptf, &rgbFrame );
-#endif
+			pollRuntimeControlPipe( ptf, displayOutputFrame );
 			if ( ! threadData.running ) {
 				break;
 			}
-			captureTimelapseFrameIfDue(
-#if BORDER_LAYOUT
-				&borderFrame
-#else
-				&rgbFrame
-#endif
-			);
+			captureTimelapseFrameIfDue( cleanCaptureFrame );
 
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );
                         printf("\nTaking snapshot and exiting\n");
-#if BORDER_LAYOUT
-                        snapshot( &borderFrame, snapshotPrefix ); // Snapshot
-#else
-                        snapshot( &rgbFrame, snapshotPrefix ); // Snapshot
-#endif
+                        snapshot( displayOutputFrame, snapshotPrefix ); // Snapshot
                         printf("%s", RESET_STR() );
                         goto SHUTDOWN;
                 }
