@@ -8059,8 +8059,8 @@ int mainPrivate (int argc, char *argv[]) {
 
 		TS( threadData.imshowMicros += ( currentTimeMicros() - imshowMicros ); ) // track relative benchmarks
 
-		~threadData.cmapScale;
-		~threadData.rgbHUD;
+		threadData.cmapScale.release();
+		threadData.rgbHUD.release();
 
 		TS( threadData.mainMicros += currentTimeMicros() - mainMicros; ) // track linear read and processing
 
