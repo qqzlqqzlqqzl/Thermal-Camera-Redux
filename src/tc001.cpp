@@ -8149,7 +8149,12 @@ int mainPrivate (int argc, char *argv[]) {
 			if ( ! threadData.running ) {
 				break;
 			}
-			captureTimelapseFrameIfDue( displayOutputFrame );
+			// A live setting command is applied after the current display frame
+			// has already been composed. Wait for the next rendered frame so
+			// the first timelapse image reflects the requested HUD/visual state.
+			if ( ! threadData.configurationChanged ) {
+				captureTimelapseFrameIfDue( displayOutputFrame );
+			}
 
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );
