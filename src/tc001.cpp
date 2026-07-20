@@ -4241,6 +4241,7 @@ void printUsage() {
   printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
   printf( "                 [-control-pipe name] for live Windows GUI controls\n");
   printf( "                 live control: calibrate blackbody targetC [roiPercent] [requestId]\n");
+  printf( "                 live control: set hud on|off\n");
   printf( "                 live control: timelapse start intervalSeconds [sessionName] | timelapse stop\n");
   printf( "                 [-perf-frames n] [-benchmark-frames n] for deterministic CLI performance tests\n");
 #if 0
@@ -7195,6 +7196,10 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 		setRuntimeRotation( ptf, atoi( value.c_str() ) );
 	} else if ( key == "fullscreen" ) {
 		setRuntimeFullscreen( ptf, parseControlBool( lowerValue ) );
+	} else if ( key == "hud" || key == "info-overlay" || key == "status-overlay" ) {
+		controls.hud = parseControlBool( lowerValue ) ? HUD_HUD : HUD_OFF;
+		controls.lastHelpScale = -1;
+		threadData.configurationChanged++;
 	} else if ( key == "interp" || key == "interpolation" ) {
 		int index = parseInterpolationIndex( value.c_str() );
 		if ( 0 <= index ) {
@@ -7973,7 +7978,6 @@ int mainPrivate (int argc, char *argv[]) {
 
 			TS( int64_t imshowMicros = currentTimeMicros(); )
 			Mat osdDisplayFrame;
-			Mat *cleanCaptureFrame = &rgbFrame;
 			Mat *displayOutputFrame = &rgbFrame;
 
 			if ( HUD_ONLY_VIDEO != controls.hud ) {
@@ -8032,8 +8036,7 @@ int mainPrivate (int argc, char *argv[]) {
 
 			pthread_mutex_unlock( &videoOutMutex );
 
-			cleanCaptureFrame = &borderFrame;
-			displayOutputFrame = cleanCaptureFrame;
+			displayOutputFrame = &borderFrame;
 			if ( HUD_HELP == controls.hud || HUD_HUD == controls.hud ) {
 				osdDisplayFrame = borderFrame.clone();
 				blendDisplayOsd( osdDisplayFrame );
@@ -8146,7 +8149,7 @@ int mainPrivate (int argc, char *argv[]) {
 			if ( ! threadData.running ) {
 				break;
 			}
-			captureTimelapseFrameIfDue( cleanCaptureFrame );
+			captureTimelapseFrameIfDue( displayOutputFrame );
 
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );

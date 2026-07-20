@@ -27,7 +27,15 @@ jobs:
             mingw-w64-x86_64-pkgconf
             unzip
 
+      - name: Restore minimal OpenCV cache
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: opencv-install
+          key: windows-2022-mingw64-opencv-${{ env.OPENCV_VERSION }}-minimal-v1
+
       - name: Build minimal OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           curl -fL --retry 5 --retry-all-errors -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"

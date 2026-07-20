@@ -69,6 +69,7 @@ static const int IDC_TIMELAPSE_INTERVAL = 1041;
 static const int IDC_TIMELAPSE_START = 1042;
 static const int IDC_TIMELAPSE_STOP = 1043;
 static const int IDC_TIMELAPSE_FOLDER = 1044;
+static const int IDC_HUD = 1045;
 
 static const UINT_PTR TIMER_PROCESS = 1;
 static const UINT_PTR TIMER_INITIAL_SYNC = 2;
@@ -92,6 +93,7 @@ static HWND g_bilateral;
 static HWND g_temporal;
 static HWND g_sharpen;
 static HWND g_fullscreen;
+static HWND g_hud;
 static HWND g_preview;
 static HWND g_status;
 static HWND g_start;
@@ -739,6 +741,7 @@ static void saveSettings() {
 	writeIni("temporal", comboValue(g_temporal, g_levelItems));
 	writeIni("sharpen", comboValue(g_sharpen, g_levelItems));
 	writeIni("fullscreen", boolValue(g_fullscreen));
+	writeIni("hud", boolValue(g_hud));
 	writeIni("preset", comboValue(g_preset, g_presetItems));
 	writeIni("blur", comboValue(g_blur, g_blurItems));
 	writeIni("contrast", comboValue(g_contrast, g_contrastItems));
@@ -804,6 +807,7 @@ static void resetDefaults() {
 	selectComboByValue(g_temporal, g_levelItems, "off", 0);
 	selectComboByValue(g_sharpen, g_levelItems, "off", 0);
 	setChecked(g_fullscreen, false);
+	setChecked(g_hud, false);
 	selectComboByValue(g_preset, g_presetItems, "custom", 0);
 	selectComboByValue(g_blur, g_blurItems, "0", 0);
 	selectComboByValue(g_contrast, g_contrastItems, "1.0", 0);
@@ -843,6 +847,7 @@ static void loadSettings() {
 	selectComboByValue(g_temporal, g_levelItems, readIni("temporal", "off"), 0);
 	selectComboByValue(g_sharpen, g_levelItems, readIni("sharpen", "off"), 0);
 	setChecked(g_fullscreen, readIni("fullscreen", "0") == "1");
+	setChecked(g_hud, readIni("hud", "0") == "1");
 	selectComboByValue(g_preset, g_presetItems, readIni("preset", "custom"), 0);
 	selectComboByValue(g_blur, g_blurItems, readIni("blur", "0"), 0);
 	selectComboByValue(g_contrast, g_contrastItems, readIni("contrast", "1.0"), 0);
@@ -963,6 +968,7 @@ static void createControls(HWND hwnd) {
 	addLabel(hwnd, L"Temperature unit", L"温度单位", leftX, yLeft, labelW, rowH);
 	g_tempUnit = addCombo(hwnd, IDC_TEMP_UNIT, leftControlX, yLeft - 2, controlW, 120);
 	addComboItems(g_tempUnit, g_tempUnitItems);
+	g_hud = addCheckbox(hwnd, IDC_HUD, L"Show HUD", L"显示 HUD 信息", leftControlX + controlW + 16, yLeft - 2, 132, rowH);
 	yLeft += gap + 8;
 
 	addLabel(hwnd, L"Enhancement", L"画质增强", leftX, yLeft, labelW + controlW, rowH);
@@ -1214,6 +1220,7 @@ static std::string allLiveSettingsCommand() {
 	appendSet(cmd, "histogram", boolValue(g_histogram));
 	appendSet(cmd, "rulers", comboValue(g_rulers, g_rulerItems));
 	appendSet(cmd, "fullscreen", boolValue(g_fullscreen));
+	appendSet(cmd, "hud", boolValue(g_hud));
 	return cmd.str();
 }
 
@@ -1465,6 +1472,7 @@ static void sendChangedControl(int id) {
 		case IDC_HISTOGRAM: sendLiveCommand("set histogram " + boolValue(g_histogram)); break;
 		case IDC_RULERS: sendLiveCommand("set rulers " + comboValue(g_rulers, g_rulerItems)); break;
 		case IDC_FULLSCREEN: sendLiveCommand("set fullscreen " + boolValue(g_fullscreen)); break;
+		case IDC_HUD: sendLiveCommand("set hud " + boolValue(g_hud)); break;
 		default: break;
 	}
 }
