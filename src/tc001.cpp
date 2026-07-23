@@ -7197,7 +7197,9 @@ static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame 
 	} else if ( key == "fullscreen" ) {
 		setRuntimeFullscreen( ptf, parseControlBool( lowerValue ) );
 	} else if ( key == "hud" || key == "info-overlay" || key == "status-overlay" ) {
-		controls.hud = parseControlBool( lowerValue ) ? HUD_HUD : HUD_OFF;
+		// The GUI exposes this as the complete display-overlay switch.
+		// Off must produce a clean image, not merely hide the three-line HUD.
+		controls.hud = parseControlBool( lowerValue ) ? HUD_HUD : HUD_ONLY_VIDEO;
 		controls.lastHelpScale = -1;
 		threadData.configurationChanged++;
 	} else if ( key == "interp" || key == "interpolation" ) {
@@ -7567,10 +7569,16 @@ int mainPrivate (int argc, char *argv[]) {
 	pthread_t thermalThread; pthread_create( &thermalThread, NULL, thermalDataThread, (void*) &threadData );
 #endif
 	// Benchmark runs stop from frame count and should not keep a blocking stdin reader alive.
+#ifndef _WIN32
 	pthread_t stdinThread;
 	if ( benchmarkFrames <= 0 ) {
 		pthread_create( &stdinThread, NULL, stdinDataThread, (void*) &threadData );
 	}
+#else
+	// Windows uses the OpenCV window plus the named control pipe. The inherited
+	// console stdin reader blocks in fgets() and can deadlock MinGW CRT cleanup
+	// while the process exits, so do not create it on this platform.
+#endif
 
 	RenderData  rdMain;
 	Rect        osdROI;

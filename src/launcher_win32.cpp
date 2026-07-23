@@ -968,7 +968,7 @@ static void createControls(HWND hwnd) {
 	addLabel(hwnd, L"Temperature unit", L"温度单位", leftX, yLeft, labelW, rowH);
 	g_tempUnit = addCombo(hwnd, IDC_TEMP_UNIT, leftControlX, yLeft - 2, controlW, 120);
 	addComboItems(g_tempUnit, g_tempUnitItems);
-	g_hud = addCheckbox(hwnd, IDC_HUD, L"Show HUD", L"显示 HUD 信息", leftControlX + controlW + 16, yLeft - 2, 132, rowH);
+	g_hud = addCheckbox(hwnd, IDC_HUD, L"Show overlays", L"显示叠加信息", leftControlX + controlW + 16, yLeft - 2, 132, rowH);
 	yLeft += gap + 8;
 
 	addLabel(hwnd, L"Enhancement", L"画质增强", leftX, yLeft, labelW + controlW, rowH);

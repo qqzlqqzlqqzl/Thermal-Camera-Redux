@@ -179,11 +179,13 @@ The GUI also exposes interval/timelapse capture:
 - Files are PNG-only and use
   `thermal-YYYYMMDD-HHMMSS-000001.png` style names. Manual `Snapshot` continues
   to save both PNG and RAW.
-- The GUI `Show HUD` checkbox is global. When off, the live view, manual PNG
-  snapshots, and timelapse PNG files omit the runtime HUD. When on, all three
-  include the same compact three-line HUD.
-- Measurement overlays such as ROI, isotherm, and temperature markers retain
-  their own controls and are independent of the HUD checkbox.
+- The GUI `Show overlays` checkbox is global. When off, the live view, manual
+  PNG snapshots, and timelapse PNG files are clean thermal images with no HUD,
+  temperature markers, center crosshair, or color scale. When on, all three
+  include the compact three-line HUD and enabled measurement overlays.
+- Measurement controls such as ROI and isotherm retain their own settings; they
+  are drawn into PNG only while `Show overlays` is enabled. RAW snapshots never
+  contain display overlays.
 
 The corresponding live-control commands are:
 
