@@ -10,17 +10,21 @@
                 	if ( RotateDisplay ) { rotate( thermalFrame, thermalFrame, rotateFlags[ RotateDisplay ] ); }
 #endif
 
-			if ( lockAutoRanging ) {
+				if ( controls.manualRangeEnabled || lockAutoRanging || ! cameraHasImageFrame ) {
 #if ! DRAW_SINGLE_THREAD
 				// processThermalFrame accesses imageFrame, 
 				// thus can't be called before imageFrame is split and rotated
-				pthread_mutex_lock( &lockAutoRangingMutex_image );
+				if ( lockAutoRanging && cameraHasImageFrame ) {
+					pthread_mutex_lock( &lockAutoRangingMutex_image );
+				}
 #endif
 
 				processThermalFrame( ptf, &thermalFrame );
 
 #if ! DRAW_SINGLE_THREAD
-				pthread_mutex_unlock( &lockAutoRangingMutex_image );
+				if ( lockAutoRanging && cameraHasImageFrame ) {
+					pthread_mutex_unlock( &lockAutoRangingMutex_image );
+				}
 #endif
 			}
 
@@ -28,7 +32,7 @@
 
                 if ( WINDOW_IMAGE != controls.windowFormat ) {
 
-                        if ( Use_Histogram || lockAutoRanging ) {
+	                        if ( Use_Histogram || controls.manualRangeEnabled || lockAutoRanging || ! cameraHasImageFrame ) {
                                 // Write historgram to copy, not original
                                 // Changing thermalFrame will break subsequent call to processThermalFrame()
 				// Only realloate copy when absolutely necessary
@@ -39,8 +43,20 @@
 					copy = Mat( thermalFrame.rows, thermalFrame.cols, CV_8UC2 );
 				} 
 
-				// Write Histrogram Equalization filter into copy 
-				if ( lockAutoRanging ) {
+				// Write Histrogram Equalization filter into copy
+					if ( ! cameraHasImageFrame ) {
+						if ( ( controls.manualRangeEnabled || lockAutoRanging ) && FILTER_TYPE_NONE != filterType ) {
+							lockAutoRangeFilter( thermalFrame, copy );
+						} else {
+							thermalToImagePixel( thermalFrame, copy );
+						}
+					} else if ( controls.manualRangeEnabled ) {
+						if ( FILTER_TYPE_NONE == filterType ) {
+							thermalToImagePixel( thermalFrame, copy );
+						} else {
+							lockAutoRangeFilter( thermalFrame, copy );
+						}
+					} else if ( lockAutoRanging ) {
 					if ( FILTER_TYPE_NONE == filterType ) {
 						copy = thermalFrame.clone();
 					} else if ( threadData.inputFile ) {
@@ -57,12 +73,12 @@
 						thermalToImagePixel( thermalFrame, copy );
 #endif
 					}
-				}
+					}
 
-				if ( Use_Histogram ) {
-                                	histogramWrapper( 
-						(( lockAutoRanging ) ? copy : thermalFrame), copy, 1 );
-				}
+					if ( Use_Histogram ) {
+						Mat *histogramSource = ( controls.manualRangeEnabled || lockAutoRanging || ! cameraHasImageFrame ) ? &copy : &thermalFrame;
+						histogramWrapper( *histogramSource, copy, 1 );
+					}
 
                                 thermalFramePtr = &copy;
                         } else {

@@ -1,0 +1,289 @@
+name: Windows build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      OPENCV_VERSION: 4.10.0
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            unzip
+
+      - name: Restore minimal OpenCV cache
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: opencv-install
+          key: windows-2022-mingw64-opencv-${{ env.OPENCV_VERSION }}-minimal-v1
+
+      - name: Build minimal OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 5 --retry-all-errors -o opencv.zip "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip"
+          curl -fL --retry 5 --retry-all-errors -o opencv_contrib.zip "https://github.com/opencv/opencv_contrib/archive/refs/tags/${OPENCV_VERSION}.zip"
+          unzip -q opencv.zip
+          unzip -q opencv_contrib.zip
+          cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/opencv-install" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DOPENCV_EXTRA_MODULES_PATH="$PWD/opencv_contrib-${OPENCV_VERSION}/modules" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio,dnn,dnn_superres \
+            -DOPENCV_GENERATE_PKGCONFIG=OFF \
+            -DBUILD_opencv_apps=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_PERF_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_JAVA=OFF \
+            -DBUILD_PROTOBUF=ON \
+            -DBUILD_opencv_python2=OFF \
+            -DBUILD_opencv_python3=OFF \
+            -DWITH_QT=OFF \
+            -DWITH_GTK=OFF \
+            -DWITH_WIN32UI=ON \
+            -DWITH_OPENGL=OFF \
+            -DWITH_FFMPEG=OFF \
+            -DWITH_GSTREAMER=OFF \
+            -DWITH_MSMF=OFF \
+            -DWITH_DSHOW=ON \
+            -DVIDEOIO_ENABLE_PLUGINS=OFF \
+            -DWITH_OPENCL=OFF \
+            -DWITH_TBB=OFF \
+            -DWITH_OPENMP=OFF \
+            -DWITH_LAPACK=OFF \
+            -DWITH_IPP=OFF \
+            -DWITH_ITT=OFF \
+            -DWITH_PROTOBUF=ON \
+            -DWITH_JPEG=ON \
+            -DWITH_PNG=ON \
+            -DWITH_TIFF=OFF \
+            -DWITH_WEBP=OFF \
+            -DWITH_OPENEXR=OFF \
+            -DWITH_JASPER=OFF \
+            -DWITH_OPENJPEG=OFF \
+            -DBUILD_JPEG=ON \
+            -DBUILD_PNG=ON \
+            -DBUILD_ZLIB=ON
+          cmake --build opencv-build --target install --parallel 2
+          find opencv-install -maxdepth 5 -type f \( -iname '*.dll' -o -name 'opencv4.pc' \) -print | sort
+
+      - name: Build redux.exe
+        working-directory: src
+        run: |
+          set -euxo pipefail
+          DEFAULT_FLAGS='-DBORDER_LAYOUT=0 -DDEFAULT_FONT=0 -DDEFAULT_COLORMAP=4 -DROTATION=0 -DDISPLAY_WIDTH=2560 -DDISPLAY_HEIGHT=1600 -DUSE_CELSIUS=0 -DHUD_ALPHA=0.4'
+          CFLAGS='-march=x86-64 -mtune=generic -pipe -fomit-frame-pointer'
+          export OPENCV_PREFIX="$PWD/../opencv-install"
+          OPENCV_LIB_DIR="$OPENCV_PREFIX/x64/mingw/lib"
+          OPENCV_BIN_DIR="$OPENCV_PREFIX/x64/mingw/bin"
+          if [ ! -d "$OPENCV_LIB_DIR" ]; then
+            OPENCV_LIB_DIR="$OPENCV_PREFIX/lib"
+            OPENCV_BIN_DIR="$OPENCV_PREFIX/bin"
+          fi
+          export PATH="$OPENCV_BIN_DIR:$PATH"
+          OPENCV_LIB_SUFFIX="$(printf '%s' "$OPENCV_VERSION" | awk -F. '{ printf "%d%d%d", $1, $2, $3 }')"
+          OPENCV_CFLAGS="-I$OPENCV_PREFIX/include"
+          OPENCV_LIBS="-L$OPENCV_LIB_DIR -lopencv_dnn_superres${OPENCV_LIB_SUFFIX} -lopencv_dnn${OPENCV_LIB_SUFFIX} -lopencv_highgui${OPENCV_LIB_SUFFIX} -lopencv_videoio${OPENCV_LIB_SUFFIX} -lopencv_imgcodecs${OPENCV_LIB_SUFFIX} -lopencv_imgproc${OPENCV_LIB_SUFFIX} -lopencv_core${OPENCV_LIB_SUFFIX}"
+          WINDOWS_LIBS="-lmf -lmfreadwrite -lmfplat -lmfuuid -lole32 -loleaut32"
+          g++ -std=c++17 -Wall -Wextra -O2 -ffast-math ${DEFAULT_FLAGS} ${CFLAGS} -DUSE_ASSERT=0 -DUSE_DNN_SUPERRES=1 tc001.cpp thread.cpp -o redux.exe -lpthread ${OPENCV_CFLAGS} ${OPENCV_LIBS} ${WINDOWS_LIBS}
+          g++ -std=c++17 -Wall -Wextra -O2 ${CFLAGS} launcher_win32.cpp -o Thermal-Camera-Redux-GUI.exe -mwindows -lcomctl32
+          ldd redux.exe | tee ../redux-ldd.txt
+          ! grep "not found" ../redux-ldd.txt | grep -vi "api-ms-win-crt-"
+
+      - name: Package runtime DLLs
+        working-directory: src
+        run: |
+          set -euxo pipefail
+          mkdir -p ../dist/windows-x64
+          cp redux.exe ../dist/windows-x64/Thermal-Camera-Redux.exe
+          cp Thermal-Camera-Redux-GUI.exe ../dist/windows-x64/
+          cp ../run_uti260b_windows.cmd ../dist/windows-x64/
+          cp ../WINDOWS_UTI260B.md ../dist/windows-x64/
+          cp ../THERMAL_CAMERA_GUI_MANUAL_zh-CN.md ../dist/windows-x64/
+          mkdir -p ../dist/windows-x64/models
+          download_model() {
+            local url="$1"
+            local out="$2"
+            local sha256="$3"
+            curl -fL --retry 5 --retry-all-errors -o "$out" "$url"
+            echo "${sha256}  ${out}" | sha256sum -c -
+          }
+          download_model \
+            "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x2.pb" \
+            "../dist/windows-x64/models/FSRCNN_x2.pb" \
+            "366b33f0084c7b3f2bf6724f0a2c77bca94fcec9d7b6d72389d330073b380d5c"
+          download_model \
+            "https://raw.githubusercontent.com/fannymonori/TF-ESPCN/master/export/ESPCN_x2.pb" \
+            "../dist/windows-x64/models/ESPCN_x2.pb" \
+            "59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d"
+          test "$(stat -c%s ../dist/windows-x64/models/FSRCNN_x2.pb)" -gt 30000
+          test "$(stat -c%s ../dist/windows-x64/models/ESPCN_x2.pb)" -gt 80000
+          cat > ../dist/windows-x64/models/AI_SUPERRES_MODELS.txt <<'EOF'
+          FSRCNN_x2.pb:
+            Source: https://github.com/Saafke/FSRCNN_Tensorflow
+            License: Apache-2.0
+            SHA256: 366b33f0084c7b3f2bf6724f0a2c77bca94fcec9d7b6d72389d330073b380d5c
+            FSRCNN paper flow: LR image -> feature extraction -> shrinking -> nonlinear mapping -> expanding -> deconvolution x2.
+            Packaged model note: this OpenCV-compatible TensorFlow export uses sub-pixel upsampling in place of the original FSRCNN deconvolution layer.
+
+          ESPCN_x2.pb:
+            Source: https://github.com/fannymonori/TF-ESPCN
+            License: Apache-2.0
+            SHA256: 59f77351e1d7c0057bf6fe088b4a8a07e42c468c8c8aebb674a6b4ea1823221d
+            Paper flow followed by this runtime: LR image -> LR-space convolution -> sub-pixel convolution / pixel shuffle x2.
+          EOF
+          OPENCV_BIN="$PWD/../opencv-install/x64/mingw/bin"
+          if [ ! -d "$OPENCV_BIN" ]; then
+            OPENCV_BIN="$PWD/../opencv-install/bin"
+          fi
+          declare -A copied
+          copy_mingw_deps() {
+            local queue=("$1")
+            while [ "${#queue[@]}" -gt 0 ]; do
+              local target="${queue[0]}"
+              queue=("${queue[@]:1}")
+              while read -r dll_name; do
+                local key
+                key="$(printf '%s' "$dll_name" | tr '[:upper:]' '[:lower:]')"
+                if [ -n "${copied[$key]:-}" ]; then
+                  continue
+                fi
+                local dll_path
+                dll_path="$(find "$OPENCV_BIN" "$MINGW_PREFIX/bin" -maxdepth 1 -iname "$dll_name" -print -quit)"
+                if [ -z "$dll_path" ]; then
+                  continue
+                fi
+                copied[$key]=1
+                cp -n "$dll_path" ../dist/windows-x64/
+                queue+=("$dll_path")
+              done < <(objdump -p "$target" | awk '/DLL Name:/ { print $3 }')
+            done
+          }
+          copy_mingw_deps redux.exe
+          copy_mingw_deps Thermal-Camera-Redux-GUI.exe
+          find "$OPENCV_BIN" -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) -exec cp -n {} ../dist/windows-x64/ \;
+          find ../dist/windows-x64 -maxdepth 1 -type f \( -iname '*opencv_videoio*.dll' -o -iname '*opencv_highgui*.dll' \) | while read -r plugin; do
+            copy_mingw_deps "$plugin"
+          done
+          if find ../dist/windows-x64 -type f \( -iname '*.a' -o -iname '*.h' -o -iname '*.hpp' -o -iname '*.pc' \) | grep -q .; then
+            echo "Runtime package contains development files"
+            find ../dist/windows-x64 -type f \( -iname '*.a' -o -iname '*.h' -o -iname '*.hpp' -o -iname '*.pc' \)
+            exit 1
+          fi
+          if find ../dist/windows-x64 -type d \( -iname include -o -iname pkgconfig -o -path '*/var/cache/pacman*' \) | grep -q .; then
+            echo "Runtime package contains SDK/cache directories"
+            find ../dist/windows-x64 -type d \( -iname include -o -iname pkgconfig -o -path '*/var/cache/pacman*' \)
+            exit 1
+          fi
+          runtime_bytes="$(du -sb ../dist/windows-x64 | awk '{ print $1 }')"
+          max_runtime_bytes=$((250 * 1024 * 1024))
+          if [ "$runtime_bytes" -gt "$max_runtime_bytes" ]; then
+            echo "Runtime package is too large: ${runtime_bytes} bytes"
+            exit 1
+          fi
+          du -sh ../dist/windows-x64
+          find ../dist/windows-x64 -maxdepth 2 -type f -printf '%P\n' | sort
+
+      - name: Smoke test packaged binary
+        working-directory: dist/windows-x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $runtimeDir = (Get-Location).Path
+          $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
+          & .\Thermal-Camera-Redux.exe -help
+          $status = $LASTEXITCODE
+          Write-Host "Thermal-Camera-Redux.exe -help exited $status"
+          $acceptedHelpExit = ($status -eq 0 -or $status -eq 255 -or $status -eq -1)
+          $guiProcess = Start-Process -FilePath .\Thermal-Camera-Redux-GUI.exe -ArgumentList '--dry-run' -Wait -PassThru
+          if ($guiProcess.ExitCode -ne 0) {
+            throw "Thermal-Camera-Redux-GUI.exe --dry-run failed with $($guiProcess.ExitCode)"
+          }
+          if (-not (Test-Path .\thermal-camera-redux-last-command.txt)) {
+            throw 'GUI dry-run did not write thermal-camera-redux-last-command.txt'
+          }
+          Get-Content .\thermal-camera-redux-last-command.txt
+          if (-not (Select-String -LiteralPath .\thermal-camera-redux-last-command.txt -Pattern '-ai-superres' -Quiet)) {
+            throw 'GUI dry-run command did not include -ai-superres'
+          }
+          if (-not (Select-String -LiteralPath .\thermal-camera-redux-last-command.txt -SimpleMatch '-ai-superres "off"' -Quiet)) {
+            throw 'GUI dry-run command did not default AI super-resolution to off'
+          }
+          if (-not (Test-Path .\models\FSRCNN_x2.pb) -or -not (Test-Path .\models\ESPCN_x2.pb)) {
+            throw 'AI super-resolution models are missing from packaged runtime'
+          }
+          if (-not (Test-Path .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md)) {
+            throw 'GUI manual is missing from packaged runtime'
+          }
+          if (-not (Select-String -LiteralPath .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md -SimpleMatch '黑体校准' -Quiet)) {
+            throw 'GUI manual does not document blackbody calibration'
+          }
+          if (-not (Select-String -LiteralPath .\THERMAL_CAMERA_GUI_MANUAL_zh-CN.md -SimpleMatch '定时连拍' -Quiet)) {
+            throw 'GUI manual does not document timelapse capture'
+          }
+          if (-not $acceptedHelpExit) {
+            $toolchainBin = Join-Path $env:RUNNER_TEMP 'msys64\mingw64\bin'
+            if (Test-Path $toolchainBin) {
+              $env:Path = "$runtimeDir;$toolchainBin;C:\Windows\System32;C:\Windows\System;C:\Windows"
+              & .\Thermal-Camera-Redux.exe -help
+              Write-Host "Thermal-Camera-Redux.exe -help with toolchain PATH exited $LASTEXITCODE"
+              $env:Path = "$runtimeDir;C:\Windows\System32;C:\Windows\System;C:\Windows"
+            }
+          }
+          $depsDir = Join-Path $env:RUNNER_TEMP 'dependencies-cli'
+          $depsZip = Join-Path $env:RUNNER_TEMP 'dependencies-cli.zip'
+          Invoke-WebRequest -Uri 'https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release_.without.peview.exe.zip' -OutFile $depsZip
+          Expand-Archive -LiteralPath $depsZip -DestinationPath $depsDir -Force
+          $unresolved = New-Object System.Collections.Generic.List[string]
+          function Find-UnresolvedDependency($node, $parent) {
+            if (-not $node['Filepath']) {
+              $unresolved.Add("parent=$parent module=$($node['ModuleName']) strategy=$($node['SearchStrategy'])")
+            }
+            foreach ($child in @($node['Dependencies'])) {
+              Find-UnresolvedDependency $child $node['ModuleName']
+            }
+          }
+          foreach ($binary in @('.\Thermal-Camera-Redux.exe', '.\Thermal-Camera-Redux-GUI.exe')) {
+            $depJson = & (Join-Path $depsDir 'Dependencies.exe') -json -chain $binary | ConvertFrom-Json -AsHashtable
+            Find-UnresolvedDependency $depJson['Root'] $binary
+          }
+          if ($unresolved.Count -eq 0) {
+            Write-Host 'DEP_UNRESOLVED none'
+          } else {
+            $unresolved | Sort-Object -Unique | ForEach-Object { Write-Host "DEP_UNRESOLVED $_" }
+          }
+          $files = Get-ChildItem -Recurse -File
+          $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+          Write-Host "Runtime files: count=$($files.Count) bytes=$totalBytes"
+          $files | Sort-Object Length -Descending | Select-Object -First 20 FullName, Length | Format-Table FullName, Length
+          if (-not $acceptedHelpExit) {
+            exit $status
+          }
+          exit 0
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermal-camera-redux-windows-x64
+          path: dist/windows-x64/

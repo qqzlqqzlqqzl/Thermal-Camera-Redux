@@ -8,12 +8,53 @@
 #include <unistd.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <chrono>
+#include <algorithm>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <cwctype>
+#include <ctype.h>
+#include <string.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+#define access _access
+static inline int nice(int) { return 0; }
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/core/mat.hpp>  // Video Frame class
+
+#ifndef USE_DNN_SUPERRES
+#define USE_DNN_SUPERRES 0
+#endif
+
+#if USE_DNN_SUPERRES
+#include <opencv2/dnn.hpp>
+#include <opencv2/dnn_superres.hpp>
+#endif
+
 #include <iostream>
 
 using namespace std;
@@ -111,6 +152,10 @@ using namespace cv;
 #endif
 
 static int offline_fps = OFFLINE_FPS;
+static long perfFrameInterval = (long)(20.0 * 25.0);
+static long benchmarkFrames = 0;
+static int64_t benchmarkFrameCounter = 0;
+static int resetPerfCountersRequested = 0;
 
 #define helpLineType		LINE_8
 #define hudLineType		LINE_8
@@ -134,64 +179,55 @@ static int offline_fps = OFFLINE_FPS;
 // timeval  has Seconds and MICRO-seconds
 // timespec has Seconds and NANO-seconds
 void sleepMillis(long millis) {
+#ifdef _WIN32
+	Sleep((DWORD)((millis < 0) ? 0 : millis));
+#else
         struct timespec ts;
         ts.tv_sec  = (millis / MILLIS_PER_SECOND);
         ts.tv_nsec = (millis % MILLIS_PER_SECOND) * 1000 * 1000;
         nanosleep(&ts, NULL);
+#endif
 }
 
 void sleepMicros(long micros) {
+#ifdef _WIN32
+	Sleep((DWORD)((micros <= 0) ? 0 : ((micros + 999) / 1000)));
+#else
         struct timespec ts;
         ts.tv_sec  = (micros / MICROS_PER_SECOND);
         ts.tv_nsec = (micros % MICROS_PER_SECOND) * 1000;
         nanosleep(&ts, NULL);
+#endif
 }
 
 void sleepNanos(long nanos) {
+#ifdef _WIN32
+	Sleep((DWORD)((nanos <= 0) ? 0 : ((nanos + 999999) / 1000000)));
+#else
         struct timespec ts;
         ts.tv_sec  = (nanos / NANOS_PER_SECOND);
         ts.tv_nsec = (nanos % NANOS_PER_SECOND);
         nanosleep(&ts, NULL);
+#endif
 }
 
 
 // Returns the current time in milliseconds.
 int64_t currentTimeMillis() {
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	int64_t s1 = (int64_t)(currentTime.tv_sec  * 1000);
-	int64_t s2 = (int64_t)(currentTime.tv_usec / 1000);
-	return s1 + s2;
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 // Returns the current time in microseconds.
 int64_t currentTimeMicros(){
-#if 1 // More accurate (but slower) than clock_gettime(CLOCK_MONOTONIC_COARSE)
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	return (currentTime.tv_sec * (int)1e6) + currentTime.tv_usec;
-#else
-	// @ 4.5X faster that gettimeofday(), but may drift over time
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-	return ( (ts.tv_sec  * (int)1e6) +
-		 (ts.tv_nsec / 1000) );
-#endif
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
 }
 
 // Returns the current time in microseconds.
 int64_t currentTimeNanos(){
-#if 1 // More accurate (but slower) than clock_gettime(CLOCK_MONOTONIC_COARSE)
-	struct timeval currentTime;
-	gettimeofday(&currentTime, NULL);
-	return (currentTime.tv_sec * NANOS_PER_SECOND) + currentTime.tv_usec;
-#else
-	// @ 4.5X faster that gettimeofday(), but may drift over time
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-	return ( (ts.tv_sec  * NANOS_PER_SECOND) +
-		  ts.tv_nsec  );
-#endif
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
 #if 0
@@ -239,6 +275,12 @@ static int takeSnapshot     = 0;
 static int takeRecording    = 0;
 const char *snapshotPrefix  = "";
 const char *recordingPrefix = "";
+static std::string controlPipeName;
+static bool timelapseActive = false;
+static double timelapseIntervalSeconds = 10.0;
+static int64_t timelapseNextCaptureMillis = 0;
+static unsigned long timelapseSequence = 0;
+static std::string timelapseOutputDir;
 
 // AlphaNumeric or '-' or '_', NOT starting with '-'
 int validatePrefix( const char *prefix ) {
@@ -287,6 +329,17 @@ void dumpV4L2() {
 // Camera's native resolution
 #define FIXED_TC_WIDTH  	256
 #define FIXED_TC_HEIGHT 	192
+#define RAW_TC_ROWS		(FIXED_TC_HEIGHT * 2)
+#define UTI260B_CAPTURE_ROWS	(RAW_TC_ROWS + 2)
+
+static const char *cameraProfileName = "tc001";
+static int cameraCaptureRows = RAW_TC_ROWS;
+static int cameraHasImageFrame = 1;
+static float kelvinScale = 64.0;
+static float temperatureOffsetCelsius = 0.0;
+static float temperatureDriftCelsiusPerMinute = 0.0;
+static int64_t temperatureDriftStartMillis = 0;
+static const char *CALIBRATION_STATUS_FILE = "thermal-camera-redux-calibration-status.txt";
 
 #ifndef HUD_ALPHA
 #define HUD_ALPHA 0.4 // 40% HUD, 60% background
@@ -330,6 +383,361 @@ static float rulerXKelvinFactor;
 static float rulerYKelvinFactor;
 
 static const char *Argv0  = "";
+static int cameraIndex = 0;
+
+#ifdef _WIN32
+template <class T>
+static void safeRelease(T **ppT) {
+	if ( ppT && *ppT ) {
+		(*ppT)->Release();
+		*ppT = NULL;
+	}
+}
+
+static std::wstring lowerWide(const std::wstring &value) {
+	std::wstring result = value;
+	std::transform(result.begin(), result.end(), result.begin(),
+		[](wchar_t ch) { return (wchar_t)towlower(ch); });
+	return result;
+}
+
+static std::wstring allocatedMfString(IMFActivate *activate, REFGUID key) {
+	WCHAR *value = NULL;
+	UINT32 length = 0;
+	std::wstring result;
+	if ( SUCCEEDED(activate->GetAllocatedString(key, &value, &length)) && value ) {
+		result.assign(value, length);
+	}
+	CoTaskMemFree(value);
+	return result;
+}
+
+static std::wstring mfGuidString(const GUID &guid) {
+	WCHAR value[64] = {0};
+	if ( 0 < StringFromGUID2(guid, value, ARRAY_COUNT(value)) ) {
+		return std::wstring(value);
+	}
+	return L"(unknown guid)";
+}
+
+static void printMfVideoDevices(IMFActivate **devices, UINT32 deviceCount) {
+	printf("Media Foundation video devices:\n");
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		std::wstring symbolicLink = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+		std::wstring friendlyName = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+		printf("  [%u] %ls\n      %ls\n",
+			i,
+			friendlyName.empty() ? L"(no friendly name)" : friendlyName.c_str(),
+			symbolicLink.empty() ? L"(no symbolic link)" : symbolicLink.c_str());
+	}
+}
+
+static void printMfNativeMediaTypes(IMFSourceReader *sourceReader) {
+	printf("Media Foundation native video formats for selected camera:\n");
+	for (DWORD i = 0; ; i++) {
+		IMFMediaType *nativeType = NULL;
+		HRESULT hr = sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
+		if ( MF_E_NO_MORE_TYPES == hr ) {
+			break;
+		}
+		if ( FAILED(hr) ) {
+			printf("  [%lu] GetNativeMediaType failed: 0x%08lx\n", (unsigned long)i, (unsigned long)hr);
+			break;
+		}
+
+		GUID subtype = {};
+		UINT32 typeWidth = 0;
+		UINT32 typeHeight = 0;
+		UINT32 fpsNumerator = 0;
+		UINT32 fpsDenominator = 0;
+		nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
+		MFGetAttributeSize(nativeType, MF_MT_FRAME_SIZE, &typeWidth, &typeHeight);
+		MFGetAttributeRatio(nativeType, MF_MT_FRAME_RATE, &fpsNumerator, &fpsDenominator);
+		std::wstring guid = mfGuidString(subtype);
+
+		printf("  [%lu] subtype(%ls %ls) size(%ux%u) fps(%u/%u)\n",
+			(unsigned long)i,
+			IsEqualGUID(MFVideoFormat_YUY2, subtype) ? L"YUY2" : L"other",
+			guid.c_str(),
+			typeWidth, typeHeight,
+			fpsNumerator, fpsDenominator);
+		nativeType->Release();
+	}
+}
+
+class WindowsRawVideoCapture {
+public:
+	bool open(int requestedIndex, bool preferUTi260B);
+	bool read(Mat &dst);
+	void release();
+	bool isOpened() const { return opened; }
+
+private:
+	IMFMediaSource *source = NULL;
+	IMFSourceReader *reader = NULL;
+	UINT32 width = FIXED_TC_WIDTH;
+	UINT32 height = UTI260B_CAPTURE_ROWS;
+	LONG stride = FIXED_TC_WIDTH * 2;
+	bool opened = false;
+	bool mfStarted = false;
+	bool comStarted = false;
+};
+
+static WindowsRawVideoCapture windowsRawCapture;
+
+bool WindowsRawVideoCapture::open(int requestedIndex, bool preferUTi260B) {
+	release();
+
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if ( SUCCEEDED(hr) ) {
+		comStarted = true;
+	} else if ( RPC_E_CHANGED_MODE != hr ) {
+		printf("%sMedia Foundation COM init failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		return false;
+	}
+
+	hr = MFStartup(MF_VERSION);
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation startup failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+	mfStarted = true;
+
+	IMFAttributes *attributes = NULL;
+	IMFActivate **devices = NULL;
+	UINT32 deviceCount = 0;
+
+	hr = MFCreateAttributes(&attributes, 1);
+	if ( SUCCEEDED(hr) ) {
+		hr = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+	}
+	if ( SUCCEEDED(hr) ) {
+		hr = MFEnumDeviceSources(attributes, &devices, &deviceCount);
+	}
+	safeRelease(&attributes);
+
+	if ( FAILED(hr) || 0 == deviceCount ) {
+		printf("%sMedia Foundation found no video capture devices: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+
+	int selected = -1;
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		std::wstring symbolicLink = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+		std::wstring friendlyName = allocatedMfString(devices[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+		std::wstring lowered = lowerWide(symbolicLink);
+		if ( preferUTi260B &&
+		     std::wstring::npos != lowered.find(L"vid_0bda") &&
+		     std::wstring::npos != lowered.find(L"pid_3901") ) {
+			selected = (int)i;
+			printf("Media Foundation selected VID_0BDA&PID_3901 camera index %d: %ls\n",
+				selected, friendlyName.c_str());
+			break;
+		}
+	}
+
+	if ( preferUTi260B && selected < 0 ) {
+		printf("%sMedia Foundation could not find USB\\VID_0BDA&PID_3901 among %u video devices\n%s",
+			RED_STR(), deviceCount, RESET_STR());
+		printMfVideoDevices(devices, deviceCount);
+		for (UINT32 i = 0; i < deviceCount; i++) {
+			devices[i]->Release();
+		}
+		CoTaskMemFree(devices);
+		release();
+		return false;
+	}
+
+	if ( selected < 0 && 0 <= requestedIndex && requestedIndex < (int)deviceCount ) {
+		selected = requestedIndex;
+	}
+
+	if ( selected < 0 ) {
+		printf("%sMedia Foundation could not select camera index %d from %u devices\n%s",
+			RED_STR(), requestedIndex, deviceCount, RESET_STR());
+		for (UINT32 i = 0; i < deviceCount; i++) {
+			devices[i]->Release();
+		}
+		CoTaskMemFree(devices);
+		release();
+		return false;
+	}
+
+	IMFMediaSource *mediaSource = NULL;
+	hr = devices[selected]->ActivateObject(IID_PPV_ARGS(&mediaSource));
+	for (UINT32 i = 0; i < deviceCount; i++) {
+		devices[i]->Release();
+	}
+	CoTaskMemFree(devices);
+
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation camera activation failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		release();
+		return false;
+	}
+
+	IMFSourceReader *sourceReader = NULL;
+	hr = MFCreateSourceReaderFromMediaSource(mediaSource, NULL, &sourceReader);
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation source reader creation failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	IMFMediaType *selectedType = NULL;
+	for (DWORD i = 0; ; i++) {
+		IMFMediaType *nativeType = NULL;
+		hr = sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
+		if ( MF_E_NO_MORE_TYPES == hr ) {
+			break;
+		}
+		if ( FAILED(hr) ) {
+			break;
+		}
+
+		GUID subtype = {};
+		UINT32 typeWidth = 0;
+		UINT32 typeHeight = 0;
+		nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
+		MFGetAttributeSize(nativeType, MF_MT_FRAME_SIZE, &typeWidth, &typeHeight);
+
+		if ( IsEqualGUID(MFVideoFormat_YUY2, subtype) &&
+		     FIXED_TC_WIDTH == (int)typeWidth &&
+		     cameraCaptureRows == (int)typeHeight ) {
+			selectedType = nativeType;
+			width = typeWidth;
+			height = typeHeight;
+			break;
+		}
+
+		nativeType->Release();
+	}
+
+	if ( ! selectedType ) {
+		printf("%sMedia Foundation could not find YUY2 %dx%d mode for selected camera\n%s",
+			RED_STR(), FIXED_TC_WIDTH, cameraCaptureRows, RESET_STR());
+		printMfNativeMediaTypes(sourceReader);
+		safeRelease(&sourceReader);
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	hr = sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, selectedType);
+	if ( SUCCEEDED(hr) ) {
+		UINT32 mediaStride = 0;
+		if ( SUCCEEDED(selectedType->GetUINT32(MF_MT_DEFAULT_STRIDE, &mediaStride)) && 0 != mediaStride ) {
+			stride = (LONG)mediaStride;
+		} else {
+			stride = (LONG)(width * 2);
+		}
+	}
+	selectedType->Release();
+
+	if ( FAILED(hr) ) {
+		printf("%sMedia Foundation could not set YUY2 %ux%u mode: 0x%08lx\n%s",
+			RED_STR(), width, height, (unsigned long)hr, RESET_STR());
+		safeRelease(&sourceReader);
+		safeRelease(&mediaSource);
+		release();
+		return false;
+	}
+
+	source = mediaSource;
+	reader = sourceReader;
+	opened = true;
+	printf("Backend: MediaFoundation raw YUY2 %ux%u stride(%ld)\n", width, height, stride);
+	return true;
+}
+
+bool WindowsRawVideoCapture::read(Mat &dst) {
+	if ( ! opened || ! reader ) {
+		return false;
+	}
+
+	for (int attempt = 0; attempt < 60; attempt++) {
+		DWORD streamIndex = 0;
+		DWORD flags = 0;
+		LONGLONG timestamp = 0;
+		IMFSample *sample = NULL;
+		HRESULT hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &streamIndex, &flags, &timestamp, &sample);
+		if ( FAILED(hr) ) {
+			printf("%sMedia Foundation ReadSample failed: 0x%08lx\n%s", RED_STR(), (unsigned long)hr, RESET_STR());
+			return false;
+		}
+		if ( flags & MF_SOURCE_READERF_ENDOFSTREAM ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( flags & MF_SOURCE_READERF_ERROR ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( flags & (MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED | MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) ) {
+			safeRelease(&sample);
+			return false;
+		}
+		if ( ! sample ) {
+			continue;
+		}
+
+		IMFMediaBuffer *buffer = NULL;
+		hr = sample->ConvertToContiguousBuffer(&buffer);
+		if ( FAILED(hr) ) {
+			safeRelease(&sample);
+			continue;
+		}
+
+		BYTE *data = NULL;
+		DWORD maxLength = 0;
+		DWORD currentLength = 0;
+		hr = buffer->Lock(&data, &maxLength, &currentLength);
+		if ( SUCCEEDED(hr) && data ) {
+			dst.create((int)height, (int)width, CV_8UC2);
+			size_t rowBytes = (size_t)width * 2;
+			size_t sourceStride = (size_t)labs(stride);
+			if ( sourceStride < rowBytes ) {
+				sourceStride = rowBytes;
+			}
+			if ( currentLength >= sourceStride * height ) {
+				for (UINT32 row = 0; row < height; row++) {
+					memcpy(dst.ptr((int)row), data + (row * sourceStride), rowBytes);
+				}
+				buffer->Unlock();
+				safeRelease(&buffer);
+				safeRelease(&sample);
+				return true;
+			}
+			buffer->Unlock();
+		}
+		safeRelease(&buffer);
+		safeRelease(&sample);
+	}
+
+	return false;
+}
+
+void WindowsRawVideoCapture::release() {
+	opened = false;
+	safeRelease(&reader);
+	if ( source ) {
+		source->Shutdown();
+		source->Release();
+		source = NULL;
+	}
+	if ( mfStarted ) {
+		MFShutdown();
+		mfStarted = false;
+	}
+	if ( comStarted ) {
+		CoUninitialize();
+		comStarted = false;
+	}
+}
+#endif
 
 // Reuse Point to minimize construction/destruction overhead
 #ifdef POINT
@@ -455,6 +863,19 @@ static unsigned short	globalImgMax_CLUT = 0;  	// 0 to 255
 static unsigned short	frameImgMin  = USHRT_MAX;
 static unsigned short	frameImgMax  = 0;
 
+static void resetAutoRangeExtrema() {
+	globalKelvinMin = USHRT_MAX;
+	globalKelvinMax = 0;
+	globalKelvinRange = 0;
+	globalImgMin = USHRT_MAX;
+	globalImgMax = 0;
+	globalImgRange = 0;
+	globalImgMin_CLUT = USHRT_MAX;
+	globalImgMax_CLUT = 0;
+	frameImgMin = USHRT_MAX;
+	frameImgMax = 0;
+}
+
 static int leftDragOff = 1; // Track left mouse buttion drag
 
 #define DECODE_ROTATION(value)	(  0 <= (value) && (value) <  90) ? 0 : \
@@ -463,6 +884,7 @@ static int leftDragOff = 1; // Track left mouse buttion drag
 
 // 0 = 0, 1 = 90, 2 = 180, 3 = 270 degrees
 static int RotateDisplay = DECODE_ROTATION ( ROTATION );
+static int ResetRotateDisplay = DECODE_ROTATION ( ROTATION );
 
 static const char * ROTATION_STR =	(  0 <= ROTATION && ROTATION <  90) ?   "0" :
 					( 90 <= ROTATION && ROTATION < 180) ?  "90" :
@@ -809,6 +1231,61 @@ Inter Inters[] = {
 #endif
 };
 
+typedef struct {
+	const char *name;
+	const char *shortName;
+} DisplayLevel;
+
+DisplayLevel DisplayLevels[] = {
+	{ "Off",    "Off" },
+	{ "Low",    "Low" },
+	{ "Medium", "Med" },
+	{ "Strong", "High" }
+};
+
+#define MAX_DISPLAY_LEVELS ARRAY_COUNT( DisplayLevels )
+
+typedef enum {
+	AI_SUPERRES_OFF = 0,
+	AI_SUPERRES_FSRCNN_X2,
+	AI_SUPERRES_ESPCN_X2,
+	AI_SUPERRES_MAX
+} AiSuperResMode;
+
+typedef struct {
+	AiSuperResMode mode;
+	const char *name;
+	const char *shortName;
+	const char *modelFile;
+	const char *modelName;
+	int scale;
+} AiSuperResOption;
+
+static AiSuperResOption AiSuperResOptions[] = {
+	{ AI_SUPERRES_OFF,       "Off",           "Off",       "",              "",       1 },
+	{ AI_SUPERRES_FSRCNN_X2, "FSRCNN x2 CPU", "FSRCNNx2",  "FSRCNN_x2.pb",  "fsrcnn", 2 },
+	{ AI_SUPERRES_ESPCN_X2,  "ESPCN x2 CPU",  "ESPCNx2",   "ESPCN_x2.pb",   "espcn",  2 }
+};
+
+#define MAX_AI_SUPERRES ARRAY_COUNT( AiSuperResOptions )
+
+static const AiSuperResOption &aiSuperResOption( int mode ) {
+	if ( mode < 0 || mode >= MAX_AI_SUPERRES ) {
+		return AiSuperResOptions[AI_SUPERRES_OFF];
+	}
+	return AiSuperResOptions[mode];
+}
+
+static const char *aiSuperResName( int mode ) {
+	return aiSuperResOption( mode ).name;
+}
+
+typedef enum {
+	ROI_MODE_OFF = 0,
+	ROI_MODE_SPOT,
+	ROI_MODE_RECT
+} RoiMode;
+
 typedef enum {
 	ACTIVE_OFF = 0,
 	ACTIVE_ON,
@@ -858,16 +1335,36 @@ int Use_Histogram; // GLOBAL KLUGE UNTIL REWORKED
 
 #else
 
+static float currentTemperatureDriftCelsius() {
+	if ( 0 != temperatureDriftStartMillis && 0.0f != temperatureDriftCelsiusPerMinute ) {
+		return (float)((double)(currentTimeMillis() - temperatureDriftStartMillis) / 60000.0) *
+			temperatureDriftCelsiusPerMinute;
+	}
+	return 0.0f;
+}
+
 float kelvin2Celsius(unsigned short kelvin) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	return ( ((float)kelvin / 64.0) - 273.15 );
+	return ( ((float)kelvin / kelvinScale) - 273.15 + temperatureOffsetCelsius + currentTemperatureDriftCelsius() );
+}
+
+static unsigned short displayedCelsiusToKelvin(float celsius) {
+	float rawCelsius = celsius - temperatureOffsetCelsius - currentTemperatureDriftCelsius();
+	float kelvin = (rawCelsius + 273.15f) * kelvinScale;
+	if ( kelvin < 0.0f ) {
+		kelvin = 0.0f;
+	}
+	if ( kelvin > (float)USHRT_MAX ) {
+		kelvin = (float)USHRT_MAX;
+	}
+	return (unsigned short)round(kelvin);
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
 long celsius2Kelvin(float celsius) { // # LeoDJ's Kelvin conversion algorithm, post #216
-	//  celsius                  = (kelvin / 64.0) - 273.15
-	//  celsius + 273.15         = (kelvin / 64.0)
-	// (celsius + 273.15) * 64.0 = kelvin
-	return ( round((celsius + 273.15)  *  64.0  ) );
+	//  celsius                        = (kelvin / kelvinScale) - 273.15
+	//  celsius + 273.15               = (kelvin / kelvinScale)
+	// (celsius + 273.15) * kelvinScale = kelvin
+	return ( round((celsius + 273.15)  *  kelvinScale  ) );
 }
 
 // Used to convert threshold to kelvin for optimized comparisons
@@ -957,6 +1454,18 @@ typedef struct {
 	int cmapCurrent;
 	int rad;
 	int inters;
+	int displayFilterPreset;
+	int bilateralLevel;
+	int temporalDenoiseLevel;
+	int sharpenLevel;
+	int aiSuperResMode;
+	int manualRangeEnabled;
+	float manualRangeMinC;
+	float manualRangeMaxC;
+	int roiMode;
+	int roiRectPercent;
+	int isothermEnabled;
+	float isothermThresholdC;
 
 	int sW;			// scaled Width  of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
 	int sH;			// scaled Height of SINGLE or WINDOW_DOUBLE - resize(sW,sH)
@@ -971,6 +1480,8 @@ typedef struct {
 	int64_t startMills;
 	double fps;
 	time_t recordStartTime; // Seconds time(null)
+	int recordingWidth;
+	int recordingHeight;
 	HUDFormat hud;          // HUDFormats
 	bool wD;		// WindowDouble if DOUBLE_WIDTH or DOUBLE_HIGH
 	bool useCelsius;
@@ -998,6 +1509,371 @@ static Temperature *user_9  = &users[9];
 static Temperature *user_10 = &users[10];
 static Temperature *user_11 = &users[11];
 static Temperature *user_CENTER_OF_RULER_INDEX = &users[CENTER_OF_RULER_INDEX];
+
+static Mat displayTemporalFrame;
+
+static int clampDisplayLevel( int level ) {
+	if ( level < 0 ) {
+		return 0;
+	}
+	if ( level >= MAX_DISPLAY_LEVELS ) {
+		return MAX_DISPLAY_LEVELS - 1;
+	}
+	return level;
+}
+
+static const char *displayLevelName( int level ) {
+	return DisplayLevels[ clampDisplayLevel( level ) ].name;
+}
+
+static const char *displayLevelShortName( int level ) {
+	return DisplayLevels[ clampDisplayLevel( level ) ].shortName;
+}
+
+static bool displayEnhancementsEnabled() {
+	return controls.displayFilterPreset > 0 ||
+	       controls.bilateralLevel       > 0 ||
+	       controls.temporalDenoiseLevel > 0 ||
+	       controls.sharpenLevel         > 0;
+}
+
+static int oddKernelForLevel( int level ) {
+	switch ( clampDisplayLevel( level ) ) {
+		case 1: return 3;
+		case 2: return 5;
+		case 3: return 7;
+		default: return 0;
+	}
+}
+
+static void resetDisplayTemporalDenoise() {
+	displayTemporalFrame.release();
+}
+
+static void applyDisplayTemporalDenoise( Mat &frame ) {
+	int level = clampDisplayLevel( controls.temporalDenoiseLevel );
+	if ( 0 == level ) {
+		resetDisplayTemporalDenoise();
+		return;
+	}
+
+	if ( frame.empty() ) {
+		return;
+	}
+
+	if ( displayTemporalFrame.empty() ||
+	     displayTemporalFrame.rows != frame.rows ||
+	     displayTemporalFrame.cols != frame.cols ||
+	     displayTemporalFrame.type() != frame.type() ) {
+		frame.copyTo( displayTemporalFrame );
+		return;
+	}
+
+	double currentWeight =
+		(1 == level) ? 0.75 :
+		(2 == level) ? 0.60 : 0.45;
+	double previousWeight = 1.0 - currentWeight;
+
+	Mat blended;
+	addWeighted( frame, currentWeight, displayTemporalFrame, previousWeight, 0.0, blended );
+	blended.copyTo( displayTemporalFrame );
+	blended.copyTo( frame );
+}
+
+static void applyDisplaySharpen( Mat &frame ) {
+	int level = clampDisplayLevel( controls.sharpenLevel );
+	if ( 0 == level || frame.empty() ) {
+		return;
+	}
+
+	double amount =
+		(1 == level) ? 0.35 :
+		(2 == level) ? 0.65 : 0.95;
+	double sigma =
+		(1 == level) ? 0.8 :
+		(2 == level) ? 1.0 : 1.2;
+
+	Mat blurred;
+	Mat sharpened;
+	GaussianBlur( frame, blurred, Size(0, 0), sigma );
+	addWeighted( frame, 1.0 + amount, blurred, -amount, 0.0, sharpened );
+	sharpened.copyTo( frame );
+}
+
+static void applyDisplaySpatialEnhancements( Mat &frame ) {
+	if ( frame.empty() ) {
+		return;
+	}
+
+	int filterKernel = oddKernelForLevel( controls.displayFilterPreset );
+	if ( 0 < filterKernel ) {
+		Mat filtered;
+		GaussianBlur( frame, filtered, Size(filterKernel, filterKernel), 0.0 );
+		filtered.copyTo( frame );
+	}
+
+	int bilateralLevel = clampDisplayLevel( controls.bilateralLevel );
+	if ( 0 < bilateralLevel ) {
+		int diameter = (1 == bilateralLevel) ? 3 : (2 == bilateralLevel) ? 5 : 7;
+		double sigmaColor = (1 == bilateralLevel) ? 18.0 : (2 == bilateralLevel) ? 32.0 : 48.0;
+		double sigmaSpace = (1 == bilateralLevel) ? 3.0 : (2 == bilateralLevel) ? 5.0 : 7.0;
+		Mat filtered;
+		bilateralFilter( frame, filtered, diameter, sigmaColor, sigmaSpace );
+		filtered.copyTo( frame );
+	}
+
+	applyDisplaySharpen( frame );
+}
+
+static void applyDisplayEnhancements( Mat &frame ) {
+	if ( frame.empty() ) {
+		return;
+	}
+
+	if ( controls.wD &&
+	     WINDOW_DOUBLE_WIDE == controls.windowFormat &&
+	     frame.cols >= (2 * controls.scaledSFWidth) &&
+	     frame.rows >= controls.scaledSFHeight ) {
+		Mat leftPane  = frame( Rect(0, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		Mat rightPane = frame( Rect(controls.scaledSFWidth, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		applyDisplaySpatialEnhancements( leftPane );
+		applyDisplaySpatialEnhancements( rightPane );
+	} else if ( controls.wD &&
+	            WINDOW_DOUBLE_HIGH == controls.windowFormat &&
+	            frame.cols >= controls.scaledSFWidth &&
+	            frame.rows >= (2 * controls.scaledSFHeight) ) {
+		Mat topPane    = frame( Rect(0, 0, controls.scaledSFWidth, controls.scaledSFHeight) );
+		Mat bottomPane = frame( Rect(0, controls.scaledSFHeight, controls.scaledSFWidth, controls.scaledSFHeight) );
+		applyDisplaySpatialEnhancements( topPane );
+		applyDisplaySpatialEnhancements( bottomPane );
+	} else {
+		applyDisplaySpatialEnhancements( frame );
+	}
+
+	applyDisplayTemporalDenoise( frame );
+}
+
+static int aiSuperResLoadedMode = AI_SUPERRES_OFF;
+static int aiSuperResFailedMode = -1;
+static std::string aiSuperResLoadedPath;
+
+#if USE_DNN_SUPERRES
+static cv::dnn_superres::DnnSuperResImpl aiSuperResDnn;
+#endif
+
+static void resetAiSuperResRuntime() {
+	aiSuperResLoadedMode = AI_SUPERRES_OFF;
+	aiSuperResFailedMode = -1;
+	aiSuperResLoadedPath.clear();
+}
+
+static void markAiSuperResFailed( int mode ) {
+	aiSuperResFailedMode = mode;
+	aiSuperResLoadedMode = AI_SUPERRES_OFF;
+	aiSuperResLoadedPath.clear();
+}
+
+static const char *aiSuperResHudStatus() {
+	int mode = controls.aiSuperResMode;
+	if ( AI_SUPERRES_OFF == mode ) {
+		return "Off";
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+	if ( MyScale < option.scale ) {
+		return "Scale<2";
+	}
+	if ( aiSuperResFailedMode == mode ) {
+		return "Fallback";
+	}
+	if ( aiSuperResLoadedMode == mode && ! aiSuperResLoadedPath.empty() ) {
+		return option.shortName;
+	}
+	return option.shortName;
+}
+
+#if USE_DNN_SUPERRES
+static bool fileExists( const std::string &path ) {
+	return ! path.empty() && 0 == access( path.c_str(), F_OK );
+}
+
+static std::string directoryName( const std::string &path ) {
+	size_t slash = path.find_last_of( "/\\" );
+	if ( slash == std::string::npos ) {
+		return "";
+	}
+	return path.substr( 0, slash );
+}
+
+static std::string joinPath( const std::string &dir, const std::string &name ) {
+	if ( dir.empty() ) {
+		return name;
+	}
+	char last = dir[ dir.size() - 1 ];
+	if ( last == '/' || last == '\\' ) {
+		return dir + name;
+	}
+#ifdef _WIN32
+	return dir + "\\" + name;
+#else
+	return dir + "/" + name;
+#endif
+}
+
+static std::string executableDir() {
+#ifdef _WIN32
+	char path[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameA( NULL, path, MAX_PATH );
+	if ( 0 < length && length < MAX_PATH ) {
+		return directoryName( std::string( path, length ) );
+	}
+#else
+	char path[PATH_MAX] = {0};
+	ssize_t length = readlink( "/proc/self/exe", path, sizeof(path) - 1 );
+	if ( 0 < length ) {
+		path[length] = '\0';
+		return directoryName( std::string( path ) );
+	}
+#endif
+	return directoryName( Argv0 );
+}
+
+static std::vector<std::string> aiSuperResModelCandidates( const AiSuperResOption &option ) {
+	std::vector<std::string> paths;
+	std::string exeDir = executableDir();
+	std::string argvDir = directoryName( Argv0 );
+
+	paths.push_back( joinPath( "models", option.modelFile ) );
+	if ( ! exeDir.empty() ) {
+		paths.push_back( joinPath( joinPath( exeDir, "models" ), option.modelFile ) );
+	}
+	if ( ! argvDir.empty() ) {
+		paths.push_back( joinPath( joinPath( argvDir, "models" ), option.modelFile ) );
+	}
+	return paths;
+}
+#endif
+
+static bool loadAiSuperResModel( int mode ) {
+	if ( AI_SUPERRES_OFF == mode ) {
+		return false;
+	}
+	if ( aiSuperResFailedMode == mode ) {
+		return false;
+	}
+	if ( aiSuperResLoadedMode == mode && ! aiSuperResLoadedPath.empty() ) {
+		return true;
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+
+#if USE_DNN_SUPERRES
+	std::string modelPath;
+	for ( const std::string &candidate : aiSuperResModelCandidates( option ) ) {
+		if ( fileExists( candidate ) ) {
+			modelPath = candidate;
+			break;
+		}
+	}
+
+	if ( modelPath.empty() ) {
+		printf("AI super-resolution model %s not found under models/; falling back to %s interpolation\n",
+			option.modelFile, Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+
+	try {
+		aiSuperResDnn.readModel( modelPath );
+		aiSuperResDnn.setModel( option.modelName, option.scale );
+		aiSuperResDnn.setPreferableBackend( cv::dnn::DNN_BACKEND_OPENCV );
+		aiSuperResDnn.setPreferableTarget( cv::dnn::DNN_TARGET_CPU );
+		aiSuperResLoadedMode = mode;
+		aiSuperResLoadedPath = modelPath;
+		aiSuperResFailedMode = -1;
+		printf("AI super-resolution enabled: %s, model %s, CPU backend\n",
+			option.name, modelPath.c_str());
+		return true;
+	} catch ( const cv::Exception &e ) {
+		printf("AI super-resolution failed to initialize %s from %s: %s; falling back to %s interpolation\n",
+			option.name, modelPath.c_str(), e.what(), Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+#else
+	printf("AI super-resolution %s requested, but this build has no OpenCV dnn_superres support; falling back to %s interpolation\n",
+		option.name, Inters[controls.inters].name);
+	markAiSuperResFailed( mode );
+	return false;
+#endif
+}
+
+static bool applyAiSuperResolution( const Mat &src, Mat &dst, const Size &targetSize ) {
+#if ! USE_DNN_SUPERRES
+	(void)dst;
+#endif
+
+	int mode = controls.aiSuperResMode;
+	if ( AI_SUPERRES_OFF == mode || src.empty() ) {
+		return false;
+	}
+
+	const AiSuperResOption &option = aiSuperResOption( mode );
+	if ( targetSize.width < (src.cols * option.scale) ||
+	     targetSize.height < (src.rows * option.scale) ) {
+		return false;
+	}
+
+	if ( ! loadAiSuperResModel( mode ) ) {
+		return false;
+	}
+
+#if USE_DNN_SUPERRES
+	try {
+		Mat input;
+		if ( CV_8U == src.depth() && ( 1 == src.channels() || 3 == src.channels() ) ) {
+			input = src;
+		} else if ( CV_8U == src.depth() && 4 == src.channels() ) {
+			cvtColor( src, input, COLOR_BGRA2BGR );
+		} else {
+			src.convertTo( input, CV_8U );
+		}
+
+		Mat upscaled;
+		// Paper-aligned placement: LR display-intensity frame in, model x2 out;
+		// pseudo-color, HUD, ROI, and recording composition stay downstream.
+		aiSuperResDnn.upsample( input, upscaled );
+		if ( upscaled.empty() ) {
+			printf("AI super-resolution inference returned an empty frame for %s; falling back to %s interpolation\n",
+				aiSuperResName( mode ), Inters[controls.inters].name);
+			markAiSuperResFailed( mode );
+			return false;
+		}
+
+		if ( upscaled.cols == targetSize.width && upscaled.rows == targetSize.height ) {
+			upscaled.copyTo( dst );
+		} else {
+			int inter = ( targetSize.width < upscaled.cols || targetSize.height < upscaled.rows ) ?
+				INTER_AREA : Inters[controls.inters].inter;
+			resize( upscaled, dst, targetSize, 0.0, 0.0, inter );
+		}
+		return true;
+	} catch ( const cv::Exception &e ) {
+		printf("AI super-resolution inference failed for %s: %s; falling back to %s interpolation\n",
+			aiSuperResName( mode ), e.what(), Inters[controls.inters].name);
+		markAiSuperResFailed( mode );
+		return false;
+	}
+#else
+	return false;
+#endif
+}
+
+static void upscaleDisplaySource( const Mat &src, Mat &dst, const Size &targetSize ) {
+	if ( ! applyAiSuperResolution( src, dst, targetSize ) ) {
+		resize( src, dst, targetSize, 0.0, 0.0, Inters[controls.inters].inter );
+	}
+}
 
 // Optimization: Remove if's from rendering routines by using function pointer
 extern void drawTempMarker( Mat & frame, Temperature &temp, Scalar &dotColor );
@@ -1670,7 +2546,9 @@ void resetDefaults() {
 
 	resetLockAutoRanging();
 
-	controls.hud          = HUD_HUD;
+	// Keep the thermal image unobstructed by default. The compact HUD remains
+	// available through the existing "h" display-mode cycle.
+	controls.hud          = HUD_OFF;
 
 	controls.inters       = 2; // INTER_CUBIC
 	controls.useCelsius   = Use_Celsius = USE_CELSIUS;
@@ -1678,6 +2556,20 @@ void resetDefaults() {
 	controls.labelCF      = controls.useCelsius ? " C" : " F";
 	controls.alpha        = 1.0;
 	controls.rad          = 0; // Blur radius (0=no blur)
+	controls.displayFilterPreset = 0;
+	controls.bilateralLevel       = 0;
+	controls.temporalDenoiseLevel = 0;
+	controls.sharpenLevel         = 0;
+	controls.aiSuperResMode       = AI_SUPERRES_OFF;
+	controls.manualRangeEnabled   = 0;
+	controls.manualRangeMinC      = 20.0f;
+	controls.manualRangeMaxC      = 45.0f;
+	controls.roiMode              = ROI_MODE_OFF;
+	controls.roiRectPercent       = 25;
+	controls.isothermEnabled      = 0;
+	controls.isothermThresholdC   = 60.0f;
+	resetDisplayTemporalDenoise();
+	resetAiSuperResRuntime();
 	controls.threshold.celsius = 2;
 	controls.cmapCurrent  = DEFAULT_COLORMAP_INDEX;
 	strcpy(controls.snaptime, "None");
@@ -1693,9 +2585,9 @@ static int HelpWidth       = TC_WIDTH;
 static int HelpHeight      = TC_HEIGHT; 
 
 #define MAX_HELP_TEXT_ROWS (20 + 1)  // Was (24 + 1)
-#define MAX_HUD_TEXT_ROWS  ( 9 + 1)
+#define MAX_HUD_TEXT_ROWS  ( 3 + 1)
 
-const char * LONGEST_HUD_STRING  = "Map: Twighlight Shift+Hist";
+const char * LONGEST_HUD_STRING  = "FPS:999.9 Off:+999.9 D:+99.99";
 const char * LONGEST_HELP_STRING = "L mb: Add temps, mv rulers ";
 
 #define MAX_SCALE_FOR_FONT 5.0
@@ -1741,6 +2633,10 @@ void setScaleControls() {
 #else
 	ColorScaleWidth = 3 + MyScale;  // 4 to N
 #endif
+	// YUY2/YUYV conversion requires an even pixel width.
+	if ( ColorScaleWidth & 1 ) {
+		ColorScaleWidth++;
+	}
 
 	// Help needs to be redrawn based on font change
 	controls.lastHelpScale = -1; // trigger Help to be redrawn
@@ -1831,6 +2727,8 @@ void setDefaults(ProcessedThermalFrame *ptf) {
 	controls.recFrameCounter = 0;
 	ptf->rColor              = &WHITE;
 	controls.recording       = 0;
+	controls.recordingWidth  = 0;
+	controls.recordingHeight = 0;
 	controls.fullscreen      = 0;
 	controls.lastHelpScale   = -1; // trigger Help to be redrawn
 	controls.windowFormat    = WINDOW_IMAGE;
@@ -2338,9 +3236,10 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		long            ktotal        = 0; // Calculate average temps in thermal frame
 		// ************* BEGIN LOOP UNROLL ***************************
 
-        	unsigned short *imgPtr = &((unsigned short *)(imageFrame.datastart))[0];
+		int scanImageRange = lockAutoRanging && cameraHasImageFrame;
+		unsigned short *imgPtr = scanImageRange ? &((unsigned short *)(imageFrame.datastart))[0] : 0;
 
-		for ( ; (usKelvinPtr < usMaxPtr); usKelvinPtr += 8 , imgPtr += 8 ) {
+		for ( ; (usKelvinPtr < usMaxPtr); usKelvinPtr += 8 ) {
 			// Linear Parsing
 			// long kelvin = usKelvinPtr[0] + (usKelvinPtr[1] << 8); // LSByte + MSByte
 
@@ -2381,7 +3280,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 			UNROLL_MAX(kmax, lmax, 6)
 			UNROLL_MAX(kmax, lmax, 7)
 
-			if ( lockAutoRanging ) {
+			if ( scanImageRange ) {
 
 #define UNROLL_IMG_MIN(g,n)	if ( g > *(imgPtr + n) ) { \
 					g = *(imgPtr + n); \
@@ -2410,6 +3309,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 				UNROLL_IMG_MAX(frameImgMax, 6)
 				UNROLL_IMG_MAX(frameImgMax, 7)
 
+				imgPtr += 8;
 			}
 		}
 		// ************* END LOOP UNROLL ***************************
@@ -2418,6 +3318,11 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		ptf->max.kelvin  = kmax;
 		ptf->min.linearI = lmin;
 		ptf->max.linearI = lmax;
+
+		if ( ! cameraHasImageFrame && lockAutoRanging ) {
+			frameImgMin = BASE_PIXEL;
+			frameImgMax = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+		}
 
 		// Grab once for CLIP or GROW
 		if ( growOrClip ) {
@@ -2448,6 +3353,29 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		frameKelvinMin    =  kmin;
 		frameKelvinMax    =  kmax;
 		frameKelvinRange  = (kmax - kmin);
+
+		if ( controls.manualRangeEnabled ) {
+			unsigned short manualMin = displayedCelsiusToKelvin( controls.manualRangeMinC );
+			unsigned short manualMax = displayedCelsiusToKelvin( controls.manualRangeMaxC );
+			if ( manualMax <= manualMin ) {
+				if ( USHRT_MAX == manualMin ) {
+					manualMin--;
+				}
+				manualMax = manualMin + 1;
+			}
+			frameKelvinMin = manualMin;
+			frameKelvinMax = manualMax;
+			frameKelvinRange = manualMax - manualMin;
+
+			globalKelvinMin = manualMin;
+			globalKelvinMax = manualMax;
+			globalKelvinRange = frameKelvinRange;
+			globalImgMin = BASE_PIXEL;
+			globalImgMax = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+			globalImgRange = globalImgMax - globalImgMin;
+			globalImgMin_CLUT = 0;
+			globalImgMax_CLUT = (unsigned short)MAX_CLUT_PIX;
+		}
 
 		// Controls to [un]lock colormap auto-ranging
 		ptf->minPixel.kelvin   = kminPixel; // kelvin is NOT kelvin here
@@ -2518,7 +3446,10 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 
 	// Colormap autoranging requires camera hardware control which we don't have
 
-	if ( lockAutoRanging ) {
+	if ( controls.manualRangeEnabled ) {
+		ptf->minPixel.celsius = controls.manualRangeMinC;
+		ptf->maxPixel.celsius = controls.manualRangeMaxC;
+	} else if ( lockAutoRanging ) {
 		ptf->minPixel.celsius = kelvin2Celsius( globalKelvinMin );
 		ptf->maxPixel.celsius = kelvin2Celsius( globalKelvinMax );
 	} else {
@@ -2533,22 +3464,29 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		minImagePixel = globalImgMin;
 		maxImagePixel = globalImgMax;
 	} else {
-		// STILL NEEDED TO GET AUTO_RANGING SUB_MAP RANGE
-  		unsigned short *usImgPtr = &((unsigned short *)(imageFrame.datastart))[0];
-		minImagePixel = usImgPtr[ ptf->min.linearI ];
-		maxImagePixel = usImgPtr[ ptf->max.linearI ];
+		if ( ! cameraHasImageFrame ) {
+			minImagePixel = BASE_PIXEL;
+			maxImagePixel = (unsigned short)(BASE_PIXEL + MAX_CLUT_PIX);
+		} else {
+			// STILL NEEDED TO GET AUTO_RANGING SUB_MAP RANGE
+			unsigned short *usImgPtr = &((unsigned short *)(imageFrame.datastart))[0];
+			minImagePixel = usImgPtr[ ptf->min.linearI ];
+			maxImagePixel = usImgPtr[ ptf->max.linearI ];
+		}
 	}
 
 	// Track either crosshair temp or ruler crosshair temp on the colormap scale
 	float chCelsius   = (rulersOn ? user_CENTER_OF_RULER_INDEX->celsius : ptf->ch.celsius);
 	float chRange     = (chCelsius - minPixelCelsius);
-	float chFraction  = (chRange / minMaxRange);
+	float chFraction  = ( 0.0 == minMaxRange ) ? 0.5 : (chRange / minMaxRange);
 
 	float minMaxRangeKelvin   = (ptf->max.kelvin - ptf->min.kelvin);
-	if ( lockAutoRanging ) {
+	float minScaleKelvin      = ptf->min.kelvin;
+	if ( controls.manualRangeEnabled || lockAutoRanging ) {
+		minScaleKelvin = globalKelvinMin;
 		minMaxRangeKelvin = (globalKelvinMax - globalKelvinMin);
 	}
-	ptf->chLevelPixel.kelvin  = ptf->min.kelvin + (minMaxRangeKelvin * chFraction);
+	ptf->chLevelPixel.kelvin  = minScaleKelvin + (minMaxRangeKelvin * chFraction);
 	ptf->chLevelPixel.linearI = (lminPixel + lmaxPixel) * chFraction;
 	ptf->chLevelPixel.celsius = minPixelCelsius + chRange;
 	ptf->chLevelPixel.row     = TC_HEIGHT * (1.0 - chFraction);
@@ -2562,9 +3500,9 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 	calcTempDisplayLocations( ptf->chLevelPixel );
 
 	if ( RERENDER_OPTIMIZATION ) {
-		if ( lockAutoRanging ) {
-//strcpy( ptf->chLevelPixel.displayLabel,  ">" );
-//strcpy( ptf->avgLevelPixel.displayLabel, "-" );
+		if ( controls.manualRangeEnabled || lockAutoRanging ) {
+	//strcpy( ptf->chLevelPixel.displayLabel,  ">" );
+	//strcpy( ptf->avgLevelPixel.displayLabel, "-" );
 			ptf->minPixel.kelvin   = globalKelvinMin;
 			ptf->maxPixel.kelvin   = globalKelvinMax;
 		}
@@ -2577,7 +3515,7 @@ void processThermalFrame( ProcessedThermalFrame *ptf, Mat *thermalFrame ) {
 		// Colormap thermal gradiant scale temps
 		float avgCelsius  = ptf->avg.celsius;
 		float avgRange    = (avgCelsius - minPixelCelsius);
-		float avgFraction = (avgRange / minMaxRange);
+		float avgFraction = ( 0.0 == minMaxRange ) ? 0.5 : (avgRange / minMaxRange);
 
 		ptf->avgLevelPixel.kelvin  = (kminPixel + kmaxPixel) * avgFraction;
 		ptf->avgLevelPixel.linearI = (lminPixel + lmaxPixel) * avgFraction;
@@ -2765,9 +3703,14 @@ void reScale(ProcessedThermalFrame *ptf, int value, bool resize) {
 	}
 }
 
-void reCF() {
-	controls.useCelsius = Use_Celsius = !controls.useCelsius;
+static void setTemperatureUnitCelsius( bool useCelsius ) {
+	controls.useCelsius = Use_Celsius = useCelsius;
 	controls.labelCF = controls.useCelsius ? " C" : " F";
+	threadData.configurationChanged++;
+}
+
+void reCF() {
+	setTemperatureUnitCelsius( ! controls.useCelsius );
 }
 
 void reThreshold(int value) {
@@ -2806,6 +3749,14 @@ void windowFormat( ProcessedThermalFrame *ptf, int value ) {
 	if ( controls.recording ) { recording(ptf, 1); } // Stop active recording
 
 	threadData.configurationChanged++;
+
+	if ( ! cameraHasImageFrame ) {
+		controls.windowFormat = WINDOW_THERMAL;
+		setWindowFormat();
+		resizeWindow( ptf );
+		setHudLock();
+		return;
+	}
 
 	controls.windowFormat += value;
 
@@ -2856,19 +3807,32 @@ VideoWriter rec() {
 	// int codec = VideoWriter::fourcc('X', 'V', 'I', 'D');  // select desired codec (must be available at runtime)
 
 	// https://docs.opencv.org/4.5.1/df/d94/samples_2cpp_2videowriter_basic_8cpp-example.html#a9
-	VideoWriter videoOut(filename, VideoWriter::fourcc('X', 'V', 'I','D'), 
-			NATIVE_FPS, 
+	int recordWidth  = controls.sW;
+	int recordHeight = controls.sH;
 #if BORDER_LAYOUT
-			Size(controls.sW, controls.sH)
-			// TODO - FIXME - VideoWriter doesn't like odd sizes
-			//Size(borderFrame.cols, borderFrame.rows)
-#else
-			Size(controls.sW, controls.sH)
+	if ( ! borderFrame.empty() ) {
+		recordWidth  = borderFrame.cols;
+		recordHeight = borderFrame.rows;
+	} else {
+		recordWidth = leftBorderWidth + controls.sW + rightBorderWidth;
+	}
 #endif
+	if ( recordWidth & 1 )  recordWidth--;
+	if ( recordHeight & 1 ) recordHeight--;
+	if ( recordWidth <= 0 )  recordWidth  = controls.sW;
+	if ( recordHeight <= 0 ) recordHeight = controls.sH;
+	controls.recordingWidth  = recordWidth;
+	controls.recordingHeight = recordHeight;
+
+	VideoWriter videoOut(filename, VideoWriter::fourcc('X', 'V', 'I','D'),
+			NATIVE_FPS,
+			Size(controls.recordingWidth, controls.recordingHeight)
 			);
 
 #if BORDER_LAYOUT
-			printf("cols %d, rows %d\n", borderFrame.cols, borderFrame.rows);
+			printf("cols %d, rows %d, recording cols %d, rows %d\n",
+				borderFrame.cols, borderFrame.rows,
+				controls.recordingWidth, controls.recordingHeight);
 #endif
 
 	return videoOut;
@@ -2902,6 +3866,7 @@ void recording( ProcessedThermalFrame *ptf, int forcedStop ) {
 					strcpy(controls.elapsed,"00:00:00");
 					ptf->videoOut.release();
 					ptf->videoOut.~VideoWriter();
+					controls.recordingWidth = controls.recordingHeight = 0;
 
 					if ( rawRecFp ) {
 						fclose( rawRecFp );
@@ -2912,6 +3877,54 @@ void recording( ProcessedThermalFrame *ptf, int forcedStop ) {
 	} catch (...) {
 	}
 
+}
+
+static void writeRecordingFrame( ProcessedThermalFrame *ptf, Mat &frame ) {
+	// Active Recording doesn't handle scale/resize/rotate changes, so ...
+	// the active recording gets stopped when these configuration changes happen.
+	if ( ! controls.recording ) {
+		return;
+	}
+
+	try {
+		time_t now          = time(NULL);
+		time_t delta        = now - controls.recordStartTime;
+		struct tm *timeinfo = gmtime (&delta);
+
+		strftime (controls.elapsed, sizeof(controls.elapsed), "%H:%M:%S", timeinfo);
+
+		pthread_mutex_lock( &videoOutMutex );
+			// Protect videoOut and recordingActive
+			if ( controls.recordingActive ) {
+				Mat frameOut = frame;
+				if ( controls.recordingWidth > 0 && controls.recordingHeight > 0 &&
+				     ( frame.cols != controls.recordingWidth || frame.rows != controls.recordingHeight ) ) {
+					if ( frame.cols >= controls.recordingWidth && frame.rows >= controls.recordingHeight ) {
+						frameOut = frame( Rect( 0, 0, controls.recordingWidth, controls.recordingHeight ) );
+					}
+				}
+				if ( frameOut.cols == controls.recordingWidth && frameOut.rows == controls.recordingHeight ) {
+					ptf->videoOut.write( frameOut );
+				}
+			}
+		pthread_mutex_unlock( &videoOutMutex );
+
+		controls.recFrameCounter++;
+
+		if ( 0 == (controls.recFrameCounter % 6) ) {
+// TODO - FIXME - This increment maybe a race condition with the main threads clearing to 0x00
+			// Signal HUD to update at least 4X / second to update elapsed timer
+			threadData.configurationChanged++;
+		}
+
+		// Raw video file grows very quickly, maybe drop a few frames ???
+#if 0 // Disabling this feature until streaming compression is added
+		if ((controls.recFrameCounter % 10) == 0) {
+			rawRecFp = writeRawFrame( rawFrame, rawRecFilename, rawRecFp, 1 );
+		}
+#endif
+	} catch (...) {
+	}
 }
 
 // Adding offline post raw still and raw video processing functionality
@@ -2929,7 +3942,7 @@ void writeRawFrame(Mat &frame, FILE *fp) {
         unsigned short *data = &((unsigned short *)(frame.datastart))[0];
 
 	// Make sure this is NOT a scaled/composited frame
-	ASSERT(( (FIXED_TC_HEIGHT * 2) == rows ))  // 2 frames
+	ASSERT(( RAW_TC_ROWS == rows ))  // 2 frames
 	ASSERT((  FIXED_TC_WIDTH       == cols ))
 	ASSERT((                     2 == chan ))
 
@@ -2973,7 +3986,7 @@ void readRawFrame(Mat &frame, FILE *fp) {
 	fread( &type,    sizeof(unsigned short), 1, fp );
 	fread( &chan,    sizeof(unsigned short), 1, fp );
 
-	ASSERT(( (FIXED_TC_HEIGHT * 2) == rows ))  // 2 frames
+	ASSERT(( RAW_TC_ROWS == rows ))  // 2 frames
 	ASSERT((  FIXED_TC_WIDTH       == cols ))
 	ASSERT((                     2 == chan ))
 
@@ -2995,7 +4008,7 @@ FILE * readRawFrame(Mat &frame, const char *filename, FILE *fp, int keepOpen, lo
 		return 0x00;
 	}
 
-#define FRAME_SIZE ((4 * sizeof(unsigned short)) + (FIXED_TC_HEIGHT*2*FIXED_TC_WIDTH * sizeof(unsigned short))) 
+#define FRAME_SIZE ((4 * sizeof(unsigned short)) + (RAW_TC_ROWS*FIXED_TC_WIDTH * sizeof(unsigned short)))
 
 	struct stat st;
 	stat(filename, &st);
@@ -3032,15 +4045,38 @@ FILE * readRawFrame(Mat &frame, const char *filename, FILE *fp, int keepOpen, lo
 }
 
 
+static bool writeSnapshotFiles( Mat *frame, const std::string &prefix, bool saveRaw ) {
+	if ( 0x00 == frame || frame->empty() || prefix.empty() ) {
+		return false;
+	}
+
+	std::string filename = prefix + ".png";
+	try {
+		if ( ! imwrite(filename, *frame) ) {
+			printf("Snapshot write failed: %s\n", filename.c_str());
+			FF();
+			return false;
+		}
+	} catch ( const cv::Exception &error ) {
+		printf("Snapshot write failed: %s (%s)\n", filename.c_str(), error.what());
+		FF();
+		return false;
+	}
+
+	if ( saveRaw ) {
+		std::string rawname = prefix + ".raw";
+		writeRawFrame( *threadData.rawFrame, rawname.c_str(), 0, 0 );
+	}
+	return true;
+}
+
 void snapshot( Mat *frame, const char *prefix ) {
 
 	//size_t strftime (char* ptr, size_t maxsize, const char* format, const struct tm* timeptr );
 	time_t rawtime;
 	struct tm * timeinfo;
 	char now [128];
-#define FN_SIZE 256
-	char filename[FN_SIZE];
-	char rawname[FN_SIZE];
+	std::string snapshotBase;
 
 	time (&rawtime);
 	timeinfo = localtime (&rawtime);
@@ -3049,26 +4085,127 @@ void snapshot( Mat *frame, const char *prefix ) {
 	strftime (controls.snaptime, sizeof(controls.snaptime), "%H:%M:%S", timeinfo);
 
 	if ( validatePrefix( prefix ) ) {
-#define MAX_PREFIX (FN_SIZE - (sizeof(".png") + 1))
-		// Make RPi compiler happy
-		strncpy( filename, prefix, MAX_PREFIX );
-		strncpy( rawname,  prefix, MAX_PREFIX );
-		filename[ MAX_PREFIX ] = 0x00;
-		rawname[  MAX_PREFIX ] = 0x00;
-		strcat( filename, ".png");
-		strcat( rawname,  ".raw");
+		snapshotBase = prefix;
 	} else {
-		sprintf(filename, "TC001%s.png", now);
-		sprintf(rawname,  "TC001%s.raw", now);
+		snapshotBase = std::string("TC001") + now;
 	}
 
 	printf("%s", GREEN_STR() );
-	//now(20231115-010012), filename(TC00120231115-010012.png), snaptime(01:00:12)
-	printf("\nnow(%s), filename(%s), snaptime(%s)\n\n", now,filename,controls.snaptime);
+	printf("\nnow(%s), filename(%s.png), snaptime(%s)\n\n", now,snapshotBase.c_str(),controls.snaptime);
 	printf("%s", RESET_STR() );
 
-	imwrite(filename, *frame);
-	writeRawFrame( *threadData.rawFrame, rawname, 0, 0 );
+	writeSnapshotFiles( frame, snapshotBase, true );
+}
+
+static bool makeDirectoryIfMissing( const std::string &path ) {
+	if ( path.empty() ) {
+		return false;
+	}
+#ifdef _WIN32
+	int result = _mkdir( path.c_str() );
+#else
+	int result = mkdir( path.c_str(), 0755 );
+#endif
+	if ( 0 == result ) {
+		return true;
+	}
+	if ( EEXIST != errno ) {
+		return false;
+	}
+	struct stat info;
+	return 0 == stat(path.c_str(), &info) && 0 != (info.st_mode & S_IFDIR);
+}
+
+static std::string defaultTimelapseSessionName() {
+	time_t rawtime;
+	struct tm *timeinfo;
+	char now[64];
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	strftime(now, sizeof(now), "session-%Y%m%d-%H%M%S", timeinfo);
+	return std::string(now);
+}
+
+static bool startTimelapse( double intervalSeconds, const std::string &requestedSession ) {
+	if ( intervalSeconds < 1.0 || intervalSeconds > 86400.0 ) {
+		printf("Timelapse status=error reason=bad-interval interval_s=%.3f\n", intervalSeconds);
+		FF();
+		return false;
+	}
+
+	std::string session = requestedSession.empty() ? defaultTimelapseSessionName() : requestedSession;
+	if ( ! validatePrefix(session.c_str()) ) {
+		printf("Timelapse status=error reason=bad-session session=%s\n", session.c_str());
+		FF();
+		return false;
+	}
+
+	if ( ! makeDirectoryIfMissing("timelapse") ) {
+		printf("Timelapse status=error reason=create-root-failed output_dir=timelapse\n");
+		FF();
+		return false;
+	}
+
+	std::string outputDir = std::string("timelapse/") + session;
+	if ( ! makeDirectoryIfMissing(outputDir) ) {
+		printf("Timelapse status=error reason=create-session-failed output_dir=%s\n", outputDir.c_str());
+		FF();
+		return false;
+	}
+
+	timelapseIntervalSeconds = intervalSeconds;
+	timelapseOutputDir = outputDir;
+	timelapseSequence = 0;
+	timelapseNextCaptureMillis = 0;
+	timelapseActive = true;
+	printf("Timelapse status=started interval_s=%.3f output_dir=%s\n",
+		timelapseIntervalSeconds, timelapseOutputDir.c_str());
+	FF();
+	return true;
+}
+
+static void stopTimelapse() {
+	if ( timelapseActive ) {
+		printf("Timelapse status=stopped frames=%lu output_dir=%s\n",
+			timelapseSequence, timelapseOutputDir.c_str());
+		FF();
+	}
+	timelapseActive = false;
+	timelapseNextCaptureMillis = 0;
+}
+
+static void captureTimelapseFrameIfDue( Mat *frame ) {
+	if ( ! timelapseActive ) {
+		return;
+	}
+
+	int64_t nowMillis = currentTimeMillis();
+	if ( timelapseNextCaptureMillis > 0 && nowMillis < timelapseNextCaptureMillis ) {
+		return;
+	}
+
+	time_t rawtime;
+	struct tm *timeinfo;
+	char now[64];
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	strftime(now, sizeof(now), "%Y%m%d-%H%M%S", timeinfo);
+
+	timelapseSequence++;
+	char sequence[32];
+	snprintf(sequence, sizeof(sequence), "%06lu", timelapseSequence);
+	std::string prefix = timelapseOutputDir + "/thermal-" + now + "-" + sequence;
+	if ( writeSnapshotFiles(frame, prefix, false) ) {
+		printf("Timelapse status=frame sequence=%lu timestamp=%s file=%s.png\n",
+			timelapseSequence, now, prefix.c_str());
+		FF();
+		timelapseNextCaptureMillis = nowMillis + (int64_t)(timelapseIntervalSeconds * 1000.0);
+	} else {
+		printf("Timelapse status=error reason=snapshot-write-failed sequence=%lu file=%s.png\n",
+			timelapseSequence, prefix.c_str());
+		FF();
+		stopTimelapse();
+	}
 }
 
 void rotateDisplay( ProcessedThermalFrame *ptf, int rotate ) {
@@ -3095,7 +4232,18 @@ void printUsage() {
   printf("\n");
   printf( "Camera Usage: \n\t%s -d n (where 'n' is the number of the desired video camera)\n\n", Argv0 );
   printf( "Offline Usage: \n\t%s -f input.raw (where input.raw is a raw dump file from %s)\n\n", Argv0, Argv0 );
-  printf( "Optional flags:  [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
+  printf( "Optional flags:  [-profile name] [-uti260b] [-rotate n] [-scale n] [-fullscreen ] [-cmap n] [-fps n] [-font n] [-clip n] [-thick n]\n");
+  printf( "                 [-celsius] [-fahrenheit]\n");
+  printf( "                 [-temp-offset-c n] [-temp-offset-f n] [-temp-drift-c-per-min n]\n");
+  printf( "                 [-interp nearest|linear|cubic|lanczos] [-display-scale n]\n");
+  printf( "                 [-ai-superres off|fsrcnn2|espcn2] CPU DNN x2 display super-resolution\n");
+  printf( "                 [-filter-preset off|low|medium|strong] [-bilateral off|low|medium|strong]\n");
+  printf( "                 [-temporal-denoise off|low|medium|strong] [-sharpen off|low|medium|strong]\n");
+  printf( "                 [-control-pipe name] for live Windows GUI controls\n");
+  printf( "                 live control: calibrate blackbody targetC [roiPercent] [requestId]\n");
+  printf( "                 live control: set hud on|off\n");
+  printf( "                 live control: timelapse start intervalSeconds [sessionName] | timelapse stop\n");
+  printf( "                 [-perf-frames n] [-benchmark-frames n] for deterministic CLI performance tests\n");
 #if 0
   printf( "                 [-help] [-quiet] [-snapshot [prefix]] [-record [prefix]]\n\n");
 #else
@@ -3153,6 +4301,16 @@ void printInfo() {
 	  DISPLAY_WIDTH, DISPLAY_HEIGHT, MAX_SCALE_STEPS, TC_DEF_SCALE, ROTATION_STR,
 	  USE_CELSIUS?"Celsius":"Fahrenheit", MAX_CMAPS, cmaps[controls.cmapCurrent]->name
        	);
+  printf("    camera profile %s, capture %dx%d, temperature scale %.1f, temperature offset %+.1f C, display rotation %d\n",
+	  cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale, temperatureOffsetCelsius,
+	  RotateDisplay * 90);
+  printf("    display super-resolution %dx %s, AI %s, filter %s, bilateral %s, temporal %s, sharpen %s\n",
+	  MyScale, Inters[controls.inters].name,
+	  aiSuperResName(controls.aiSuperResMode),
+	  displayLevelName(controls.displayFilterPreset),
+	  displayLevelName(controls.bilateralLevel),
+	  displayLevelName(controls.temporalDenoiseLevel),
+	  displayLevelName(controls.sharpenLevel));
   printf("    %s-threaded with %s scrolling\n",
 
 #if DRAW_SINGLE_THREAD
@@ -3270,26 +4428,17 @@ FILTER_TYPE_CHANGE:
 			  break;
 
 
-		case 'l': lockAutoRanging = (lockAutoRanging + 1) % AUTO_RANGE_MAX;
-			  threadData.configurationChanged++;
-			  setHudLock();
-			  {
-				// Reset autoRanging controls
-				globalKelvinMin = USHRT_MAX;
-				globalKelvinMax = 0;
-				globalImgMin    = USHRT_MAX;
-				globalImgMax    = 0;
-				frameImgMin     = USHRT_MAX;
-				frameImgMax     = 0;
-			  }
-			  break;
+			case 'l': lockAutoRanging = (lockAutoRanging + 1) % AUTO_RANGE_MAX;
+				  threadData.configurationChanged++;
+				  setHudLock();
+				  resetAutoRangeExtrema();
+				  break;
 
 		case 'y': 
 			  threadData.configurationChanged++;
 			  Use_Histogram = !Use_Histogram; break; // Temp filter
 
 		case 't': 
-			  threadData.configurationChanged++;
 			  reCF(); break;           // Temp format
 
 		case 'h': hud(1); break;  // Display onscreen elements
@@ -3310,13 +4459,21 @@ FILTER_TYPE_CHANGE:
 		case '5': 
 			  threadData.configurationChanged++;
 			  resetDefaults(); 
+			  if ( ! cameraHasImageFrame ) {
+				  RotateDisplay = ResetRotateDisplay;
+				  setHeightWidth();
+				  controls.windowFormat = WINDOW_THERMAL;
+				  setWindowFormat();
+				  setHudLock();
+				  resizeWindow(ptf);
+			  }
 			  if ( rulersOn ) {
 			  	// Reset rulers to center of screen
-				rulers(ptf, FIXED_TC_WIDTH/2, FIXED_TC_HEIGHT/2, 0); 
+				rulers(ptf, TC_HALF_WIDTH, TC_HALF_HEIGHT, 0);
 			  } else {
 			  	// Reset ruler anchors to center of screen
-			 	rulersX = FIXED_TC_WIDTH/2; 
-				rulersY = FIXED_TC_HEIGHT/2;
+				rulersX = TC_HALF_WIDTH;
+				rulersY = TC_HALF_HEIGHT;
 			  }
 			  break;    // Reset Defaults
 
@@ -3349,6 +4506,7 @@ FILTER_TYPE_CHANGE:
 
 		case '1': 
 			  threadData.configurationChanged++;
+			  if ( controls.recording ) { recording(ptf, 1); } // Font metrics can change BORDER_LAYOUT recording size
 			  UserFont = ( UserFont + 1 ) % MAX_USER_FONT;
 			  setScaleControls();
 			  break;
@@ -3708,6 +4866,8 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 {
 	char buf[256];
 	const char *labelCF = controls.labelCF;
+	(void)src;
+	(void)srcColor;
 
 	float yOffset = 1.4 * (float) hudSpaceSize.height;
 	float yDelta  = (float)HudHeight / (float)MAX_HUD_TEXT_ROWS;
@@ -3721,52 +4881,222 @@ void drawHUD(ProcessedThermalFrame *ptf, Mat &rgbHUD, const char *src, Scalar sr
 	POINT( hudPoint, HudWidth, HudHeight );
 	rectangle(rgbHUD, PointZeroZero, hudPoint, BLACK, -1);
 
-	// put text in the box
+	// Keep the optional HUD compact: measurement summary, display pipeline,
+	// and live performance/calibration state only.
 	POINT( hudPoint, L_X, Y(0) );
-	putText(rgbHUD, tempStr(buf,"Avg Temp: ", ptf->avg, labelCF), hudPoint,
-	Default_Font, HudFontScale, WHITE, 1, hudLineType);
+	snprintf(buf, sizeof(buf), "Avg: %.1f%s Map:%s%s",
+		CorF(ptf->avg.celsius), labelCF,
+		cmaps[controls.cmapCurrent]->name, Use_Histogram ? "+Hist" : "");
+	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, WHITE, 1, hudLineType);
 
-	// Threshold is a [0-N] delta in degrees, not a temp
+	snprintf(buf, sizeof(buf), "SR:%dx %s AI:%s",
+		MyScale, Inters[controls.inters].name, aiSuperResHudStatus());
 	POINT( hudPoint, L_X, Y(1) );
-	putText(rgbHUD, tempStr(buf,"Threshold: ", controls.threshold.celsius,labelCF), hudPoint,
-	Default_Font, HudFontScale, WHITE, 1, hudLineType);
+	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
 
-	//sprintf(buf, "Colormap: %s", cmaps[controls.cmapCurrent].name);
-	sprintf(buf, "Map: %s%s", cmaps[controls.cmapCurrent]->name, Use_Histogram?"+Hist":"");
+	if ( 0.0 != temperatureOffsetCelsius || 0.0f != temperatureDriftCelsiusPerMinute ) {
+		snprintf(buf, sizeof(buf), "FPS:%.1f Off:%+.1f D:%+.2f", controls.fps,
+			temperatureOffsetCelsius, temperatureDriftCelsiusPerMinute);
+	} else {
+		snprintf(buf, sizeof(buf), "FPS:%.1f", controls.fps);
+	}
 	POINT( hudPoint, L_X, Y(2) );
 	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+}
 
-	sprintf(buf, "Blur: %d  Intr: %s", controls.rad, Inters[controls.inters].name);
-	POINT( hudPoint, L_X, Y(3) );
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+static void blendDisplayOsd( Mat &frame ) {
+	if ( frame.empty() || threadData.rgbHUD.empty() ) {
+		return;
+	}
 
- 	//sprintf(buf, "Scale: %d  Src: %s", MyScale, src );
- 	sprintf(buf, "Scale: %d  Src: ", MyScale ); // Add Source error color
+	Rect roi;
+	roi.x = roi.y = 0;
+	if ( HUD_HELP == controls.hud ) {
+		roi.width  = min( HelpWidth,  SCALED_TC_WIDTH  );
+		roi.height = min( HelpHeight, SCALED_TC_HEIGHT );
+	} else if ( HUD_HUD == controls.hud ) {
+		roi.width  = min( HudWidth,  SCALED_TC_WIDTH  );
+		roi.height = min( HudHeight, SCALED_TC_HEIGHT );
+	} else {
+		return;
+	}
 
-	// Get width offset to display src in srcColor
-	int baseline;
-	Size ts = getTextSize(buf, Default_Font, HudFontScale, 1, &baseline);
+	roi.width  = min( roi.width,  frame.cols );
+	roi.height = min( roi.height, frame.rows );
+	if ( roi.width <= 0 || roi.height <= 0 ) {
+		return;
+	}
 
-	POINT( hudPoint, L_X, Y(4) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW,   1, hudLineType);
-	POINT( hudPoint, L_X+ts.width, Y(4) );
-	putText(rgbHUD, src, hudPoint, Default_Font, HudFontScale, srcColor, 1, hudLineType);
+	Mat frameROI = frame( roi );
+	Mat hudROI = threadData.rgbHUD( Rect(0, 0, roi.width, roi.height) );
+	addWeighted( frameROI, 1-HUD_ALPHA, hudROI, HUD_ALPHA, 0.0, frameROI );
+}
 
-	sprintf(buf, "Contrast: %.1f%s", controls.alpha, threadData.FreezeFrame ? " Freeze" : "" );
-	POINT( hudPoint, L_X, Y(5) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+static Rect displayPaneRect( Mat &frame ) {
+	int x = (WINDOW_DOUBLE_WIDE == controls.windowFormat) ? controls.scaledSFWidth : 0;
+	int y = (WINDOW_DOUBLE_HIGH == controls.windowFormat) ? controls.scaledSFHeight : 0;
+	if ( x >= frame.cols ) {
+		x = 0;
+	}
+	if ( y >= frame.rows ) {
+		y = 0;
+	}
+	int width = min( controls.scaledSFWidth, frame.cols - x );
+	int height = min( controls.scaledSFHeight, frame.rows - y );
+	return Rect( x, y, max(width, 1), max(height, 1) );
+}
 
-	sprintf(buf, "Snapshot: %s", controls.snaptime);
-	POINT( hudPoint, L_X, Y(6) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+static void drawOverlayText( Mat &frame, const char *text, Point loc, Scalar color ) {
+	double fontScale = max( 0.35, (double)MyFontScale );
+	putText( frame, text, loc, Default_Font, fontScale, BLACK, 3, LINE_AA );
+	putText( frame, text, loc, Default_Font, fontScale, color, 1, LINE_AA );
+}
 
-      	sprintf(buf, "Recording: %s", controls.elapsed);
-	POINT( hudPoint, L_X, Y(7) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, *ptf->rColor, 1, hudLineType);
+static void drawIsothermOverlay( Mat &frame ) {
+	if ( ! controls.isothermEnabled || thermalFrame.empty() || frame.empty() ) {
+		return;
+	}
 
-	sprintf(buf, "FPS: %.1f  %s", controls.fps, controls.labelWF);
-	POINT( hudPoint, L_X, Y(8) ); 
-	putText(rgbHUD, buf, hudPoint, Default_Font, HudFontScale, YELLOW, 1, hudLineType);
+	Rect pane = displayPaneRect( frame );
+	Mat mask( TC_HEIGHT, TC_WIDTH, CV_8UC1 );
+	unsigned char *maskPtr = mask.ptr<unsigned char>(0);
+	unsigned short *thermalPtr = &((unsigned short *)(thermalFrame.datastart))[0];
+	int maxPixels = TC_WIDTH * TC_HEIGHT;
+	for ( int i = 0; i < maxPixels; i++ ) {
+		maskPtr[i] = ( kelvin2Celsius( thermalPtr[i] ) >= controls.isothermThresholdC ) ? 255 : 0;
+	}
+
+	Mat scaledMask;
+	resize( mask, scaledMask, Size( pane.width, pane.height ), 0.0, 0.0, INTER_NEAREST );
+	Mat target = frame( pane );
+	Mat hot( target.size(), target.type(), Scalar( 0, 0, 255 ) );
+	Mat blended;
+	addWeighted( target, 0.45, hot, 0.55, 0.0, blended );
+	blended.copyTo( target, scaledMask );
+}
+
+static void drawSpotOverlay( Mat &frame, ProcessedThermalFrame *ptf ) {
+	Rect pane = displayPaneRect( frame );
+	Point center( pane.x + pane.width / 2, pane.y + pane.height / 2 );
+	line( frame, Point( center.x - 12, center.y ), Point( center.x + 12, center.y ), WHITE, 1, LINE_AA );
+	line( frame, Point( center.x, center.y - 12 ), Point( center.x, center.y + 12 ), WHITE, 1, LINE_AA );
+	circle( frame, center, 5, BLACK, 2, LINE_AA );
+	circle( frame, center, 5, YELLOW, 1, LINE_AA );
+
+	char buf[128];
+	snprintf( buf, sizeof(buf), "Spot %.1f%s", CorF(ptf->ch.celsius), controls.labelCF );
+	Point textLoc( min( center.x + 10, pane.x + pane.width - 90 ), max( center.y - 10, pane.y + 18 ) );
+	drawOverlayText( frame, buf, textLoc, YELLOW );
+}
+
+struct RoiTemperatureStats {
+	bool valid;
+	int percent;
+	unsigned long count;
+	float minC;
+	float avgC;
+	float maxC;
+};
+
+static RoiTemperatureStats centerRoiTemperatureStats( int requestedPercent ) {
+	RoiTemperatureStats stats = {};
+	stats.valid = false;
+	stats.percent = requestedPercent;
+	stats.count = 0;
+
+	if ( thermalFrame.empty() ) {
+		return stats;
+	}
+
+	int percent = requestedPercent;
+	if ( percent < 5 ) {
+		percent = 5;
+	} else if ( percent > 100 ) {
+		percent = 100;
+	}
+	stats.percent = percent;
+
+	int roiW = max( 1, (TC_WIDTH  * percent) / 100 );
+	int roiH = max( 1, (TC_HEIGHT * percent) / 100 );
+	int roiX = (TC_WIDTH  - roiW) / 2;
+	int roiY = (TC_HEIGHT - roiH) / 2;
+
+	unsigned short *thermalPtr = &((unsigned short *)(thermalFrame.datastart))[0];
+	unsigned short minKelvin = USHRT_MAX;
+	unsigned short maxKelvin = 0;
+	unsigned long long totalKelvin = 0;
+	unsigned long count = 0;
+	for ( int y = roiY; y < roiY + roiH; y++ ) {
+		unsigned short *row = &thermalPtr[ y * TC_WIDTH ];
+		for ( int x = roiX; x < roiX + roiW; x++ ) {
+			unsigned short kelvin = row[x];
+			if ( minKelvin > kelvin ) {
+				minKelvin = kelvin;
+			}
+			if ( maxKelvin < kelvin ) {
+				maxKelvin = kelvin;
+			}
+			totalKelvin += kelvin;
+			count++;
+		}
+	}
+	if ( 0 == count ) {
+		return stats;
+	}
+
+	stats.valid = true;
+	stats.count = count;
+	stats.minC = kelvin2Celsius( minKelvin );
+	stats.avgC = kelvin2Celsius( (unsigned short)( totalKelvin / count ) );
+	stats.maxC = kelvin2Celsius( maxKelvin );
+	return stats;
+}
+
+static RoiTemperatureStats emptyRoiTemperatureStats( int requestedPercent ) {
+	RoiTemperatureStats stats = {};
+	stats.valid = false;
+	stats.percent = max( 5, min( 100, requestedPercent ) );
+	stats.count = 0;
+	return stats;
+}
+
+static void drawRectRoiOverlay( Mat &frame ) {
+	RoiTemperatureStats stats = centerRoiTemperatureStats( controls.roiRectPercent );
+	if ( ! stats.valid ) {
+		return;
+	}
+
+	int percent = stats.percent;
+	int roiW = max( 1, (TC_WIDTH  * percent) / 100 );
+	int roiH = max( 1, (TC_HEIGHT * percent) / 100 );
+	int roiX = (TC_WIDTH  - roiW) / 2;
+	int roiY = (TC_HEIGHT - roiH) / 2;
+
+	Rect pane = displayPaneRect( frame );
+	Rect scaledRoi( pane.x + roiX * MyScale, pane.y + roiY * MyScale,
+	                max(1, roiW * MyScale), max(1, roiH * MyScale) );
+	scaledRoi &= pane;
+	if ( scaledRoi.width <= 0 || scaledRoi.height <= 0 ) {
+		return;
+	}
+
+	rectangle( frame, scaledRoi, BLACK, 3, LINE_AA );
+	rectangle( frame, scaledRoi, GREEN, 1, LINE_AA );
+
+	char buf[160];
+	snprintf( buf, sizeof(buf), "ROI min %.1f avg %.1f max %.1f%s",
+	          CorF(stats.minC), CorF(stats.avgC), CorF(stats.maxC), controls.labelCF );
+	Point textLoc( scaledRoi.x, max( pane.y + 18, scaledRoi.y - 6 ) );
+	drawOverlayText( frame, buf, textLoc, GREEN );
+}
+
+static void drawAnalysisOverlays( Mat &frame, ProcessedThermalFrame *ptf ) {
+	drawIsothermOverlay( frame );
+	if ( ROI_MODE_SPOT == controls.roiMode ) {
+		drawSpotOverlay( frame, ptf );
+	} else if ( ROI_MODE_RECT == controls.roiMode ) {
+		drawRectRoiOverlay( frame );
+	}
 }
 
 
@@ -4086,37 +5416,6 @@ void drawUserAndRulerTemps( int horizontal ) {
 	if ( drawMin ) { drawTempMarker( *threadData.rgbFrame, ptf->min, BLUE ); }
 
 #if ! BORDER_LAYOUT
-		try {
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) 
-			{
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) 
-			{
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
-		} catch (...) {
-			controls.lastHelpScale = -1; // trigger Help to be redrawn
-			printf("%s(%d) - HUD exception (%d)\n", __func__, __LINE__, horizontal); 
-			FF();
-		}
-
 	//	try {
 			{ // Draw opaque Colormap Gradient Scale
 				// Reversed from Mat cmapScale(width,height)
@@ -4250,38 +5549,6 @@ void drawUserAndRulerTemps( int horizontal ) {
 #endif
 
 		if ( drawMin ) { drawTempMarker( *threadData.rgbFrame, ptf->min, BLUE ); }
-
-#if ! BORDER_LAYOUT
-		try {
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) {
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) {
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = frame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
-		} 
-		catch (...) {
-			controls.lastHelpScale = -1; // trigger Help to be redrawn
-			printf("%s(%d) - HUD exception (%d)\n", __func__, __LINE__, horizontal); 
-			FF();
-		}
-#endif
 
 	} else {
 		// Top and bottom 2 of vertical
@@ -4606,6 +5873,9 @@ unsigned short thermalRangeFilter_Generic( unsigned int thermalPixel ) {
 	if ( FILTER_TYPE_NONE == filterType ) {
 		return thermalPixel;
 	}
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		return BASE_PIXEL;
+	}
 
 	// Do range clipping
 	if	  ( thermalPixel <= globalKelvinMin ) {	// Low Clip
@@ -4659,6 +5929,9 @@ unsigned short thermalRangeFilter_Generic( unsigned int thermalPixel ) {
 
 
 unsigned short thermalRangeFilter_Linear( unsigned int thermalPixel ) {
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		return BASE_PIXEL;
+	}
 
 	// Do range clipping
 	if	  ( thermalPixel <= globalKelvinMin ) {	// Low Clip
@@ -4679,7 +5952,15 @@ unsigned short thermalRangeFilter_Linear( unsigned int thermalPixel ) {
 
 // This method will auto-range because it works straight from frameKelvinMid * frameKelvinRange
 unsigned short thermal2Image( unsigned int thermalPixel ) {
+	if ( 0 == frameKelvinRange ) {
+		return BASE_PIXEL;
+	}
 	float zero2One = (((float)thermalPixel - (float)frameKelvinMin) / (float)frameKelvinRange);
+	if ( zero2One < 0.0 ) {
+		zero2One = 0.0;
+	} else if ( 1.0 < zero2One ) {
+		zero2One = 1.0;
+	}
 	thermalPixel   = (( MAX_CLUT_PIX * zero2One ) + BASE_PIXEL);
 	return ( thermalPixel & 0x000080FF );
 }
@@ -4727,7 +6008,10 @@ void lockAutoRangeFilter( Mat &src, Mat &dst ) {
 	/*****************************************************************************
 		Emulate Disabling auto ranging:
 	*****************************************************************************/
-	ASSERT(( 0.0 != globalKelvinRange ))
+	if ( 0 == globalKelvinRange || 0 == globalImgRange ) {
+		thermalToImagePixel( src, dst );
+		return;
+	}
 
 	int max = src.rows * src.cols;
 
@@ -4882,28 +6166,175 @@ void *thermalDataThread( void *ptr ) {
 #endif // if ! DRAW_SINGLE_THREAD /* ] */
 
 
+void setTC001Profile() {
+	cameraProfileName = "tc001";
+	cameraCaptureRows = RAW_TC_ROWS;
+	cameraHasImageFrame = 1;
+	kelvinScale = 64.0;
+}
+
+void setUTi260BProfile() {
+	cameraProfileName = "uti260b-0bda3901";
+	cameraCaptureRows = UTI260B_CAPTURE_ROWS;
+	cameraHasImageFrame = 0;
+	kelvinScale = 16.0;
+	RotateDisplay = 1;
+	ResetRotateDisplay = RotateDisplay;
+	setHeightWidth();
+	controls.windowFormat = WINDOW_THERMAL;
+	setWindowFormat();
+	setHudLock();
+	threadData.configurationChanged++;
+}
+
+int setCameraProfile(const char *profile) {
+	if ((0 == strcmp(profile, "tc001")) ||
+	    (0 == strcmp(profile, "p2")) ||
+	    (0 == strcmp(profile, "p2pro"))) {
+		setTC001Profile();
+		return 0;
+	}
+
+	if ((0 == strcmp(profile, "uti260b")) ||
+	    (0 == strcmp(profile, "uti260b-0bda3901")) ||
+	    (0 == strcmp(profile, "tiny1b")) ||
+	    (0 == strcmp(profile, "0bda3901"))) {
+		setUTi260BProfile();
+		return 0;
+	}
+
+	printf("%sUnknown camera profile '%s'\n%s", RED_STR(), profile, RESET_STR());
+	return -1;
+}
+
+int normalizeRawFrame(Mat &captureFrame, Mat &rawFrame) {
+	if ( captureFrame.empty() ) {
+		return -1;
+	}
+
+	Mat frame = captureFrame.isContinuous() ? captureFrame : captureFrame.clone();
+	size_t byteCount = frame.total() * frame.elemSize();
+	static int captureFrameInfoPrinted = 0;
+	if ( ! captureFrameInfoPrinted ) {
+		printf("%sCaptured frame: cols(%d) rows(%d) type(%d) channels(%d) elemSize(%zu) bytes(%zu)\n%s",
+			BLUE_STR(),
+			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
+			captureFrame.elemSize(), byteCount,
+			RESET_STR());
+		captureFrameInfoPrinted = 1;
+	}
+
+	if ( CV_8UC2 == frame.type() &&
+	     frame.cols >= FIXED_TC_WIDTH &&
+	     frame.rows >= RAW_TC_ROWS ) {
+		Mat visibleRows = frame( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
+		visibleRows.copyTo(rawFrame);
+		return 0;
+	}
+
+	if ( CV_8UC1 != frame.type() && CV_8UC2 != frame.type() ) {
+		printf("%sUnsupported converted frame: cols(%d) rows(%d) type(%d) channels(%d). Raw YUYV capture must be CV_8UC1 or CV_8UC2.\n%s",
+			RED_STR(),
+			captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(),
+			RESET_STR());
+		return -1;
+	}
+
+	int candidateRows[] = { cameraCaptureRows, UTI260B_CAPTURE_ROWS, RAW_TC_ROWS };
+	for (int i = 0; i < ARRAY_COUNT(candidateRows); i++) {
+		int rows = candidateRows[i];
+		if ( rows < RAW_TC_ROWS || 0 != (byteCount % rows) ) {
+			continue;
+		}
+
+		size_t bytesPerRow = byteCount / rows;
+		if ( 0 != (bytesPerRow % 2) ) {
+			continue;
+		}
+
+		if ( bytesPerRow != (size_t)(FIXED_TC_WIDTH * 2) ) {
+			continue;
+		}
+
+		int pixelsPerRow = (int)(bytesPerRow / 2);
+
+		Mat yuyvRows(rows, pixelsPerRow, CV_8UC2, frame.data);
+		Mat visibleRows = yuyvRows( Rect(0, 0, FIXED_TC_WIDTH, RAW_TC_ROWS) );
+		visibleRows.copyTo(rawFrame);
+		return 0;
+	}
+
+	printf("%sUnsupported frame: cols(%d) rows(%d) type(%d) channels(%d) bytes(%zu). Expected raw YUYV %dx%d or %dx%d.\n%s",
+		RED_STR(),
+		captureFrame.cols, captureFrame.rows, captureFrame.type(), captureFrame.channels(), byteCount,
+		FIXED_TC_WIDTH, RAW_TC_ROWS,
+		FIXED_TC_WIDTH, UTI260B_CAPTURE_ROWS,
+		RESET_STR());
+	return -1;
+}
+
+void configureCapture( VideoCapture &cap ) {
+#ifdef _WIN32
+	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','2'));
+#else
+	cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('Y','U','Y','V'));
+#endif
+	cap.set(CAP_PROP_FRAME_WIDTH,  FIXED_TC_WIDTH);
+	cap.set(CAP_PROP_FRAME_HEIGHT, cameraCaptureRows);
+	cap.set(CAP_PROP_FPS, offline_fps);
+	cap.set(CAP_PROP_CONVERT_RGB, 0.0);
+#ifdef _WIN32
+	cap.set(CAP_PROP_FORMAT, -1.0);
+#endif
+	cap.set(CAP_PROP_MONOCHROME,  1.0);
+}
+
 int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
-#if 1
+#ifdef _WIN32
+	if ( 0 == strcmp(cameraProfileName, "uti260b-0bda3901") ) {
+		if ( ! windowsRawCapture.open(cameraIndex, true) ) {
+			return -1;
+		}
+	} else {
+		int backends[] = { CAP_DSHOW, CAP_MSMF, CAP_ANY };
+		for (int i = 0; i < ARRAY_COUNT(backends); i++) {
+			cap.release();
+			cap.open(cameraIndex, backends[i]);
+			if ( cap.isOpened() ) {
+				configureCapture(cap);
+				break;
+			}
+		}
+	}
+#elif 1
   	cap = VideoCapture(camera, CAP_V4L); // CAP_V4L dictates frame buffer size and format 
 #else
   	cap = VideoCapture(camera, CAP_FFMPEG); // CAP_FFMPEG dictates frame buffer size and format 
 #endif
 
 	printf( BLUE_STR() );
-	printf("%s(%d): Opening cameara %s\n", __func__,__LINE__, camera); FF();
+	printf("%s(%d): Opening cameara %s profile(%s) capture(%dx%d) temp_scale(%.1f) temp_offset(%+.1f C) rotate(%d)\n",
+		__func__,__LINE__, camera, cameraProfileName, FIXED_TC_WIDTH, cameraCaptureRows, kelvinScale,
+		temperatureOffsetCelsius, RotateDisplay * 90); FF();
 	printf( RESET_STR() );
  
 	// V4L - Video for Linux
 	// RGB needed for thermal data
 	// Convert to COLOR_YUV2BGR_YUYV for playback
-	cap.set(CAP_PROP_CONVERT_RGB, 0.0); 
-	cap.set(CAP_PROP_MONOCHROME,  1.0); 
+	if ( cap.isOpened() ) {
+		configureCapture(cap);
+	}
 	// TODO-FIXME - Investigate CAP_PROP_FORMAT and -1 for raw
 	// Can it be set CV_8UC2, 1 channel of unsigned short
 
 	// Check if camera opened successfully
-	if ( ! cap.isOpened() ) {
+#ifdef _WIN32
+	bool rawCameraOpened = windowsRawCapture.isOpened();
+#else
+	bool rawCameraOpened = false;
+#endif
+	if ( ! cap.isOpened() && ! rawCameraOpened ) {
 		printf( RED_STR() );
 		if ( fileExists( camera ) ) {
 			printf( "\nError opening video stream(%s)\n\n", camera); FF();
@@ -4932,23 +6363,25 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 
 // Need 4.8 OpenCV for hardware acceleration
 //	cap.get(cv::CAP_PROP_HW_ACCELERATION),
-	cout << "Backend: " << cap.getBackendName() << endl;
-	printf("fps(%.2f) mode(%.2f) foc(%.2f) br(%.2f) fmt(%.2f) gamma(%.2f) sharp(%.2f) temp(%.2f) hue(%.2f) gain(%.2f) contrast(%.2f) bright(%.2f) exposure(%.2f) saturation(%.2f)\n", 
-		cap.get(CAP_PROP_FPS),
-		cap.get(CAP_PROP_MODE),
-		cap.get(CAP_PROP_FOCUS),
-		cap.get(CAP_PROP_BITRATE),
-		cap.get(CAP_PROP_CODEC_PIXEL_FORMAT),
-		cap.get(CAP_PROP_GAMMA),
-		cap.get(CAP_PROP_SHARPNESS),
-		cap.get(CAP_PROP_TEMPERATURE),
-		cap.get(CAP_PROP_HUE),
-		cap.get(CAP_PROP_GAIN),
-		cap.get(CAP_PROP_CONTRAST),
-		cap.get(CAP_PROP_BRIGHTNESS),
-		cap.get(CAP_PROP_EXPOSURE),
-		cap.get(CAP_PROP_SATURATION)
-		);
+	if ( cap.isOpened() ) {
+		cout << "Backend: " << cap.getBackendName() << endl;
+		printf("fps(%.2f) mode(%.2f) foc(%.2f) br(%.2f) fmt(%.2f) gamma(%.2f) sharp(%.2f) temp(%.2f) hue(%.2f) gain(%.2f) contrast(%.2f) bright(%.2f) exposure(%.2f) saturation(%.2f)\n",
+			cap.get(CAP_PROP_FPS),
+			cap.get(CAP_PROP_MODE),
+			cap.get(CAP_PROP_FOCUS),
+			cap.get(CAP_PROP_BITRATE),
+			cap.get(CAP_PROP_CODEC_PIXEL_FORMAT),
+			cap.get(CAP_PROP_GAMMA),
+			cap.get(CAP_PROP_SHARPNESS),
+			cap.get(CAP_PROP_TEMPERATURE),
+			cap.get(CAP_PROP_HUE),
+			cap.get(CAP_PROP_GAIN),
+			cap.get(CAP_PROP_CONTRAST),
+			cap.get(CAP_PROP_BRIGHTNESS),
+			cap.get(CAP_PROP_EXPOSURE),
+			cap.get(CAP_PROP_SATURATION)
+			);
+	}
 	return 1;
 }
 
@@ -4969,8 +6402,144 @@ int openCamera( VideoCapture &cap, char *camera, int displayUsage ) {
 double perfMax    = -1; // Keep track of longest thread duration
 double waitMicros = -1; // Keep thread wait times
 
+static bool strEqualsIgnoreCase( const char *a, const char *b ) {
+	if ( ! a || ! b ) {
+		return false;
+	}
+
+	while ( *a && *b ) {
+		if ( tolower((unsigned char)*a) != tolower((unsigned char)*b) ) {
+			return false;
+		}
+		a++;
+		b++;
+	}
+	return (0 == *a && 0 == *b);
+}
+
+static bool isIntegerString( const char *value ) {
+	if ( ! value || ! *value ) {
+		return false;
+	}
+	if ( '-' == *value || '+' == *value ) {
+		value++;
+	}
+	if ( ! *value ) {
+		return false;
+	}
+	while ( *value ) {
+		if ( ! isdigit((unsigned char)*value) ) {
+			return false;
+		}
+		value++;
+	}
+	return true;
+}
+
+static int parseScaleValue( const char *value ) {
+	int scale = atoi( value );
+	if ( scale < 1 ) {
+		scale = 1;
+	}
+	if ( scale > MAX_SCALE_STEPS ) {
+		scale = MAX_SCALE_STEPS;
+	}
+	return scale;
+}
+
+static int parseDisplayLevel( const char *value ) {
+	if ( isIntegerString( value ) ) {
+		return clampDisplayLevel( atoi( value ) );
+	}
+
+	if ( strEqualsIgnoreCase( value, "off" ) ||
+	     strEqualsIgnoreCase( value, "none" ) ||
+	     strEqualsIgnoreCase( value, "0" ) ) {
+		return 0;
+	}
+	if ( strEqualsIgnoreCase( value, "low" ) ||
+	     strEqualsIgnoreCase( value, "light" ) ||
+	     strEqualsIgnoreCase( value, "1" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "medium" ) ||
+	     strEqualsIgnoreCase( value, "med" ) ||
+	     strEqualsIgnoreCase( value, "2" ) ) {
+		return 2;
+	}
+	if ( strEqualsIgnoreCase( value, "strong" ) ||
+	     strEqualsIgnoreCase( value, "high" ) ||
+	     strEqualsIgnoreCase( value, "3" ) ) {
+		return 3;
+	}
+	return -1;
+}
+
+static int parseAiSuperResMode( const char *value ) {
+	if ( ! value ) {
+		return -1;
+	}
+	if ( strEqualsIgnoreCase( value, "off" ) ||
+	     strEqualsIgnoreCase( value, "none" ) ||
+	     strEqualsIgnoreCase( value, "0" ) ) {
+		return AI_SUPERRES_OFF;
+	}
+	if ( strEqualsIgnoreCase( value, "fsrcnn" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn2" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn-x2" ) ||
+	     strEqualsIgnoreCase( value, "fsrcnn_x2" ) ||
+	     strEqualsIgnoreCase( value, "1" ) ) {
+		return AI_SUPERRES_FSRCNN_X2;
+	}
+	if ( strEqualsIgnoreCase( value, "espcn" ) ||
+	     strEqualsIgnoreCase( value, "espcn2" ) ||
+	     strEqualsIgnoreCase( value, "espcn-x2" ) ||
+	     strEqualsIgnoreCase( value, "espcn_x2" ) ||
+	     strEqualsIgnoreCase( value, "2" ) ) {
+		return AI_SUPERRES_ESPCN_X2;
+	}
+	return -1;
+}
+
+static int parseInterpolationIndex( const char *value ) {
+	if ( isIntegerString( value ) ) {
+		int index = atoi( value );
+		if ( index < 0 || index >= MAX_INTERS ) {
+			return -1;
+		}
+		return index;
+	}
+
+	for ( int i = 0; i < MAX_INTERS; i++ ) {
+		if ( strEqualsIgnoreCase( value, Inters[i].name ) ) {
+			return i;
+		}
+	}
+
+	if ( strEqualsIgnoreCase( value, "bilinear" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "bicubic" ) ) {
+		return 2;
+	}
+	if ( strEqualsIgnoreCase( value, "lanczos" ) ) {
+		return 4;
+	}
+	if ( strEqualsIgnoreCase( value, "nearest" ) ) {
+		return 0;
+	}
+	if ( strEqualsIgnoreCase( value, "linear" ) ) {
+		return 1;
+	}
+	if ( strEqualsIgnoreCase( value, "cubic" ) ) {
+		return 2;
+	}
+	return -1;
+}
+
 int parseArgs( int argc, char *argv[], char *camera, VideoCapture &cap, ProcessedThermalFrame *ptf ) {
 	int inputNotFound = -1;
+	int openCameraAfterParse = 0;
 	int next;
 	int hasNext;
 	for ( int i = 1; i < argc; i++ ) {
@@ -4978,8 +6547,14 @@ int parseArgs( int argc, char *argv[], char *camera, VideoCapture &cap, Processe
 		next    = (i + 1);
 		hasNext = (next < argc);
 
-		if ( ! strcmp( argv[i], "-scale") && hasNext ) {
-			MyScale = abs( atoi( argv[ i + 1 ] ) ) % (MAX_SCALE_STEPS+1);
+		if (( ! strcmp( argv[i], "-scale") ||
+		      ! strcmp( argv[i], "-display-scale") ||
+		      ! strcmp( argv[i], "-superres") ||
+		      ! strcmp( argv[i], "-super-resolution")) && hasNext ) {
+			MyScale = parseScaleValue( argv[ i + 1 ] );
+			MyHalfScale = MyScale / 2;
+			setScaleControls();
+			threadData.configurationChanged++;
 			i++;
 		} else if ( ! strcmp( argv[i], "-fullscreen") ) {
 			controls.fullscreen = 1;
@@ -5009,8 +6584,114 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 		} else if ( ! strcmp( argv[i], "-cmap") && hasNext ) {
 			controls.cmapCurrent = abs( atoi( argv[ i + 1 ] ) ) % MAX_CMAPS;
 			i++;
+		} else if (( ! strcmp( argv[i], "-interp") ||
+			     ! strcmp( argv[i], "-interpolation")) && hasNext ) {
+			int index = parseInterpolationIndex( argv[ i + 1 ] );
+			if ( index < 0 ) {
+				printf("%sUnknown interpolation '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.inters = index;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-ai-superres") ||
+			     ! strcmp( argv[i], "-ai-sr") ||
+			     ! strcmp( argv[i], "-superres-ai")) && hasNext ) {
+			int mode = parseAiSuperResMode( argv[ i + 1 ] );
+			if ( mode < 0 ) {
+				printf("%sUnknown AI super-resolution mode '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.aiSuperResMode = mode;
+			resetAiSuperResRuntime();
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-blur") ||
+			     ! strcmp( argv[i], "-box-blur")) && hasNext ) {
+			controls.rad = abs( atoi( argv[ i + 1 ] ) );
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-filter-preset") ||
+			     ! strcmp( argv[i], "-display-filter")) && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown filter preset '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.displayFilterPreset = level;
+			threadData.configurationChanged++;
+			i++;
+		} else if ( ! strcmp( argv[i], "-bilateral") && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown bilateral level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.bilateralLevel = level;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-temporal-denoise") ||
+			     ! strcmp( argv[i], "-temporal")) && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown temporal denoise level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.temporalDenoiseLevel = level;
+			if ( 0 == level ) {
+				resetDisplayTemporalDenoise();
+			}
+			threadData.configurationChanged++;
+			i++;
+		} else if ( ! strcmp( argv[i], "-sharpen") && hasNext ) {
+			int level = parseDisplayLevel( argv[ i + 1 ] );
+			if ( level < 0 ) {
+				printf("%sUnknown sharpen level '%s'\n%s", RED_STR(), argv[ i + 1 ], RESET_STR());
+				return -1;
+			}
+			controls.sharpenLevel = level;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-celsius") ||
+			     ! strcmp( argv[i], "-temp-celsius") )) {
+			setTemperatureUnitCelsius( true );
+		} else if (( ! strcmp( argv[i], "-fahrenheit") ||
+			     ! strcmp( argv[i], "-temp-fahrenheit") )) {
+			setTemperatureUnitCelsius( false );
+		} else if ( ! strcmp( argv[i], "-control-pipe") && hasNext ) {
+			controlPipeName = argv[ i + 1 ];
+			i++;
 		} else if ( ! strcmp( argv[i], "-fps") && hasNext ) {
 			offline_fps = abs( atoi( argv[ i + 1 ] ) );
+			i++;
+		} else if ( ! strcmp( argv[i], "-perf-frames") && hasNext ) {
+			perfFrameInterval = max( 1, abs( atoi( argv[ i + 1 ] ) ) );
+			i++;
+		} else if ( ! strcmp( argv[i], "-benchmark-frames") && hasNext ) {
+			benchmarkFrames = max( 1, abs( atoi( argv[ i + 1 ] ) ) );
+			i++;
+		} else if ( ! strcmp( argv[i], "-profile") && hasNext ) {
+			if ( setCameraProfile( argv[ i + 1 ] ) < 0 ) {
+				return -1;
+			}
+			i++;
+		} else if ( ! strcmp( argv[i], "-uti260b") ) {
+			setUTi260BProfile();
+		} else if (( ! strcmp( argv[i], "-temp-offset-c") ||
+			     ! strcmp( argv[i], "-offset-c"     )) && hasNext ) {
+			temperatureOffsetCelsius = atof( argv[ i + 1 ] );
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-temp-offset-f") ||
+			     ! strcmp( argv[i], "-offset-f"     )) && hasNext ) {
+			temperatureOffsetCelsius = atof( argv[ i + 1 ] ) * 5.0 / 9.0;
+			threadData.configurationChanged++;
+			i++;
+		} else if (( ! strcmp( argv[i], "-temp-drift-c-per-min") ||
+			     ! strcmp( argv[i], "-drift-c-per-min"     )) && hasNext ) {
+			temperatureDriftCelsiusPerMinute = (float)atof( argv[ i + 1 ] );
+			temperatureDriftStartMillis = currentTimeMillis();
+			threadData.configurationChanged++;
 			i++;
 		} else if ( ! strcmp( argv[i], "-clip") && hasNext ) {
 			rulerBoundFlag = abs( atoi( argv[ i + 1 ] ) ) % BOUND_MAX_MOD;
@@ -5033,7 +6714,9 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			if ( 3 < RotateDisplay ) {
 				RotateDisplay = 0;
 			}
-			rotateDisplay( ptf, 0 );
+			ResetRotateDisplay = RotateDisplay;
+			setHeightWidth();
+			setWindowFormat();
 			i++;
 		} else if (( ! strcmp( argv[i], "-f"    ) ||
 			     ! strcmp( argv[i], "-file" ) ) && hasNext ) {
@@ -5044,27 +6727,677 @@ printf("\n%s-record [prefix] is coming soon ...\n%s", BLUE_STR(), RESET_STR() );
 			}
 			filterType  = FILTER_TYPE_NONE; // Show Nuked Kelvin data in WINDOW_DOUBLE
 			inputNotFound = 0;
+			openCameraAfterParse = 0;
 			i++;
 		} else if (( ! strcmp( argv[i], "-d"      ) ||
 			     ! strcmp( argv[i], "-device" ) ) && hasNext ) {
 			threadData.source    = "Camera";
+#ifdef _WIN32
+			cameraIndex = abs( atoi(argv[i + 1]) );
+			sprintf( camera, "%d", cameraIndex );
+#else
 			sprintf( camera, "/dev/video%d", abs( atoi(argv[i + 1]) ) ); // Default is camera 0
+#endif
 			threadData.inputFile = 0;
 			if ( ! quietStdout ) {
 //				printf("%s(%d): Opening camera %s\n", __func__,__LINE__, camera ); FF();
 			}
-			if ( openCamera( cap, camera, 1 ) < 0 ) {
-				return -1;
-			}
 			inputNotFound = 0;
+			openCameraAfterParse = 1;
 			i++;
 		} else {
 			printf("%sUnknown argv[%d] (%s) or missing value\n%s", RED_STR(), i, argv[i], RESET_STR() );
 			return -1;
 		}
 	}
+
+	if ( openCameraAfterParse ) {
+		if ( openCamera( cap, camera, 1 ) < 0 ) {
+			return -1;
+		}
+	}
+
 	return inputNotFound;
 }
+
+static std::string trimControlString( const std::string &value ) {
+	size_t start = value.find_first_not_of(" \t\r\n");
+	if ( start == std::string::npos ) {
+		return "";
+	}
+	size_t end = value.find_last_not_of(" \t\r\n");
+	return value.substr(start, end - start + 1);
+}
+
+static std::string lowerControlString( std::string value ) {
+	for ( char &ch : value ) {
+		ch = (char)tolower((unsigned char)ch);
+	}
+	return value;
+}
+
+static bool parseControlBool( const std::string &value ) {
+	return value == "1" ||
+	       value == "on" ||
+	       value == "true" ||
+	       value == "yes" ||
+	       value == "enabled";
+}
+
+static void setRuntimeScale( ProcessedThermalFrame *ptf, int scale ) {
+	int target = parseScaleValue( std::to_string(scale).c_str() );
+	if ( target == MyScale ) {
+		return;
+	}
+	if ( controls.recording ) {
+		recording( ptf, 1 );
+	}
+	threadData.configurationChanged++;
+	MyScale = target;
+	MyHalfScale = MyScale / 2;
+	horizFlickerTomFoolery();
+	setScaleControls();
+	resetDisplayTemporalDenoise();
+	if ( ! controls.fullscreen ) {
+		resizeWindow( ptf );
+	}
+	if ( rulersOn ) {
+		rulers( ptf, rulersX, rulersY, 0 );
+	}
+}
+
+static void setRuntimeRotation( ProcessedThermalFrame *ptf, int degrees ) {
+	int target = DECODE_ROTATION( degrees );
+	if ( target < 0 || target > 3 ) {
+		target = 0;
+	}
+	while ( RotateDisplay != target ) {
+		rotateDisplay( ptf, 1 );
+	}
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeFullscreen( ProcessedThermalFrame *ptf, bool enabled ) {
+	if ( controls.fullscreen != enabled ) {
+		toggleFullScreen( ptf );
+	}
+}
+
+static void setRuntimeDisplayLevel( int &target, const std::string &value ) {
+	int level = parseDisplayLevel( value.c_str() );
+	if ( level < 0 ) {
+		return;
+	}
+	if ( target != level ) {
+		target = level;
+		threadData.configurationChanged++;
+	}
+}
+
+static void setRuntimeAiSuperResMode( const std::string &value ) {
+	int mode = parseAiSuperResMode( value.c_str() );
+	if ( mode < 0 ) {
+		return;
+	}
+	if ( controls.aiSuperResMode != mode ) {
+		controls.aiSuperResMode = mode;
+		resetAiSuperResRuntime();
+		resetDisplayTemporalDenoise();
+		threadData.configurationChanged++;
+	}
+}
+
+static void setRuntimeMappingFilter( int value ) {
+	if ( value < 0 ) {
+		value = 0;
+	}
+	if ( value >= FILTER_TYPE_MAX ) {
+		value = FILTER_TYPE_MAX - 1;
+	}
+	filterType = value;
+	thermalRangeFilter_FxPtr = (FILTER_TYPE_LINEAR == filterType) ?
+		&thermalRangeFilter_Linear :
+		&thermalRangeFilter_Generic;
+	filterType2 = ((FILTER_TYPE_LINEAR_2 == filterType) ||
+	               (FILTER_TYPE_CENTER_2 == filterType) ||
+	               (FILTER_TYPE_OUTER_2  == filterType));
+	threadData.configurationChanged++;
+	setHudLock();
+}
+
+static void setRuntimeAutoRange( int value ) {
+	if ( value < AUTO_RANGE_NONE ) {
+		value = AUTO_RANGE_NONE;
+	}
+	if ( value >= AUTO_RANGE_MAX ) {
+		value = AUTO_RANGE_MAX - 1;
+	}
+	lockAutoRanging = value;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+	setHudLock();
+}
+
+static void setRuntimeManualRange( bool enabled, float minC, float maxC ) {
+	if ( maxC <= minC ) {
+		maxC = minC + 1.0f;
+	}
+	controls.manualRangeEnabled = enabled ? 1 : 0;
+	controls.manualRangeMinC = minC;
+	controls.manualRangeMaxC = maxC;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeRoiMode( const std::string &value ) {
+	std::string mode = lowerControlString( value );
+	if ( mode == "off" || mode == "0" ) {
+		controls.roiMode = ROI_MODE_OFF;
+	} else if ( mode == "spot" || mode == "point" || mode == "1" ) {
+		controls.roiMode = ROI_MODE_SPOT;
+	} else if ( mode == "rect" || mode == "rectangle" || mode == "box" || mode == "2" ) {
+		controls.roiMode = ROI_MODE_RECT;
+	}
+	threadData.configurationChanged++;
+}
+
+static void setRuntimeRulerMode( ProcessedThermalFrame *ptf, int value ) {
+	if ( value < 0 ) {
+		value = 0;
+	}
+	rulersOn = (RulerModes)( value % (int)RULERS_MAX_MOD );
+	threadData.configurationChanged++;
+	if ( rulersOn ) {
+		rulers( ptf, rulersX, rulersY, 0 );
+	} else {
+		clearUserTemps( ptf );
+	}
+}
+
+static void setRuntimePreset( ProcessedThermalFrame *ptf, const std::string &name ) {
+	std::string preset = lowerControlString( name );
+	bool knownPreset = preset == "raw" ||
+	                   preset == "pcb" ||
+	                   preset == "hvac" ||
+	                   preset == "human" ||
+	                   preset == "low-noise" ||
+	                   preset == "low_noise" ||
+	                   preset == "high-contrast" ||
+	                   preset == "high_contrast";
+	if ( knownPreset ) {
+		controls.aiSuperResMode = AI_SUPERRES_OFF;
+		resetAiSuperResRuntime();
+	}
+	if ( preset == "raw" ) {
+		controls.alpha = 1.0;
+		controls.cmapCurrent = 0;
+		controls.rad = 0;
+		controls.displayFilterPreset = 0;
+		controls.bilateralLevel = 0;
+		controls.temporalDenoiseLevel = 0;
+		controls.sharpenLevel = 0;
+		controls.isothermEnabled = 0;
+		controls.manualRangeEnabled = 0;
+	} else if ( preset == "pcb" ) {
+		controls.alpha = 1.15;
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "lanczos" );
+		controls.cmapCurrent = min( 27, MAX_CMAPS - 1 );
+		controls.displayFilterPreset = 1;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 1;
+		controls.sharpenLevel = 2;
+		controls.isothermEnabled = 1;
+		controls.isothermThresholdC = 55.0f;
+	} else if ( preset == "hvac" ) {
+		controls.alpha = 1.15;
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "lanczos" );
+		controls.cmapCurrent = 4;
+		controls.displayFilterPreset = 2;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 1;
+		controls.sharpenLevel = 1;
+		controls.isothermEnabled = 1;
+		controls.isothermThresholdC = 35.0f;
+	} else if ( preset == "human" ) {
+		controls.alpha = 1.0;
+		setRuntimeScale( ptf, 4 );
+		controls.inters = parseInterpolationIndex( "cubic" );
+		controls.cmapCurrent = 17 < MAX_CMAPS ? 17 : 4;
+		controls.displayFilterPreset = 1;
+		controls.bilateralLevel = 1;
+		controls.temporalDenoiseLevel = 2;
+		controls.sharpenLevel = 1;
+		setRuntimeManualRange( true, 20.0f, 42.0f );
+	} else if ( preset == "low-noise" || preset == "low_noise" ) {
+		controls.alpha = 1.0;
+		controls.displayFilterPreset = 2;
+		controls.bilateralLevel = 2;
+		controls.temporalDenoiseLevel = 2;
+		controls.sharpenLevel = 1;
+	} else if ( preset == "high-contrast" || preset == "high_contrast" ) {
+		controls.alpha = 1.35;
+		controls.displayFilterPreset = 0;
+		controls.bilateralLevel = 0;
+		controls.temporalDenoiseLevel = 0;
+		controls.sharpenLevel = 2;
+	}
+	resetDisplayTemporalDenoise();
+	threadData.configurationChanged++;
+}
+
+static void writeBlackbodyCalibrationStatus(
+	const std::string &requestId,
+	const char *status,
+	const char *reason,
+	float targetC,
+	const RoiTemperatureStats &stats,
+	float deltaC,
+	float offsetC,
+	float driftC,
+	int driftReset ) {
+	FILE *fp = fopen( CALIBRATION_STATUS_FILE, "w" );
+	if ( fp ) {
+		fprintf( fp,
+			"blackbody-calibration id=%s status=%s reason=%s target_c=%.3f measured_c=%.3f delta_c=%.3f offset_c=%.3f drift_c=%.3f drift_reset=%d roi_percent=%d samples=%lu\n",
+			requestId.empty() ? "-" : requestId.c_str(),
+			status ? status : "unknown",
+			reason ? reason : "-",
+			targetC,
+			stats.valid ? stats.avgC : 0.0f,
+			deltaC,
+			offsetC,
+			driftC,
+			driftReset,
+			stats.percent,
+			stats.count );
+		fclose( fp );
+	}
+}
+
+static void calibrateBlackbodyOffset( float targetC, int roiPercent, const std::string &requestId ) {
+	RoiTemperatureStats stats = centerRoiTemperatureStats( roiPercent );
+	if ( !(targetC > -100.0f && targetC < 300.0f) ) {
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", targetC, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=%.3f\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetC);
+		FF();
+		return;
+	}
+	if ( ! stats.valid ) {
+		writeBlackbodyCalibrationStatus( requestId, "error", "no-frame", targetC, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=no-frame target_c=%.3f roi_percent=%d\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetC, stats.percent);
+		FF();
+		return;
+	}
+
+	float oldOffset = temperatureOffsetCelsius;
+	float activeDrift = currentTemperatureDriftCelsius();
+	float deltaC = targetC - stats.avgC;
+	int driftReset = (0.0001f < fabs(activeDrift)) || (0.0001f < fabs(temperatureDriftCelsiusPerMinute));
+	temperatureOffsetCelsius += activeDrift + deltaC;
+	temperatureDriftCelsiusPerMinute = 0.0f;
+	temperatureDriftStartMillis = currentTimeMillis();
+	controls.roiMode = ROI_MODE_RECT;
+	controls.roiRectPercent = stats.percent;
+	resetAutoRangeExtrema();
+	threadData.configurationChanged++;
+
+	writeBlackbodyCalibrationStatus( requestId, "ok", "-", targetC, stats, deltaC, temperatureOffsetCelsius, activeDrift, driftReset );
+	printf("Blackbody calibration id=%s status=ok target_c=%.3f measured_c=%.3f delta_c=%.3f offset_c=%.3f old_offset_c=%.3f drift_c=%.3f drift_reset=%d roi_percent=%d samples=%lu\n",
+		requestId.empty() ? "-" : requestId.c_str(),
+		targetC, stats.avgC, deltaC, temperatureOffsetCelsius, oldOffset, activeDrift, driftReset, stats.percent, stats.count);
+	FF();
+}
+
+static void parseBlackbodyCalibrationCommand( std::istringstream &iss, bool hasModeToken ) {
+	if ( hasModeToken ) {
+		std::string mode;
+		iss >> mode;
+		mode = lowerControlString( mode );
+		if ( mode != "blackbody" && mode != "black-body" && mode != "uniform" ) {
+			return;
+		}
+	}
+	int roiPercent = controls.roiRectPercent;
+	std::string targetText;
+	std::string roiText;
+	std::string requestId;
+	if ( iss >> targetText ) {
+		if ( iss >> roiText ) {
+			char *roiEnd = 0x00;
+			long parsedRoi = strtol( roiText.c_str(), &roiEnd, 10 );
+			if ( roiEnd != roiText.c_str() && '\0' == *roiEnd ) {
+				roiPercent = max( 5, min( 100, (int)parsedRoi ) );
+				if ( iss >> requestId ) {
+					requestId = trimControlString( requestId );
+				}
+			} else {
+				requestId = trimControlString( roiText );
+			}
+		}
+	} else {
+		RoiTemperatureStats stats = emptyRoiTemperatureStats( roiPercent );
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", 0.0f, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=missing\n",
+			requestId.empty() ? "-" : requestId.c_str());
+		FF();
+		return;
+	}
+
+	char *targetEnd = 0x00;
+	double parsedTarget = strtod( targetText.c_str(), &targetEnd );
+	if ( targetEnd == targetText.c_str() || '\0' != *targetEnd ) {
+		RoiTemperatureStats stats = emptyRoiTemperatureStats( roiPercent );
+		writeBlackbodyCalibrationStatus( requestId, "error", "bad-target", 0.0f, stats, 0.0f, temperatureOffsetCelsius, currentTemperatureDriftCelsius(), 0 );
+		printf("Blackbody calibration id=%s status=error reason=bad-target target_c=%s\n",
+			requestId.empty() ? "-" : requestId.c_str(), targetText.c_str());
+		FF();
+		return;
+	}
+	calibrateBlackbodyOffset( (float)parsedTarget, roiPercent, requestId );
+}
+
+static void applyRuntimeControl( const std::string &line, ProcessedThermalFrame *ptf, Mat *frame ) {
+	std::string trimmed = trimControlString( line );
+	if ( trimmed.empty() ) {
+		return;
+	}
+
+	std::istringstream iss( trimmed );
+	std::string command;
+	iss >> command;
+	command = lowerControlString( command );
+
+	if ( command == "snapshot" ) {
+		snapshot( frame, 0x00 );
+		threadData.configurationChanged++;
+		return;
+	}
+	if ( command == "timelapse" || command == "time-lapse" || command == "interval-capture" ) {
+		std::string action;
+		iss >> action;
+		action = lowerControlString( action );
+		if ( action == "stop" || action == "off" ) {
+			stopTimelapse();
+			return;
+		}
+		if ( action == "start" || action == "on" ) {
+			std::string intervalText;
+			std::string session;
+			if ( ! (iss >> intervalText) ) {
+				printf("Timelapse status=error reason=missing-interval\n");
+				FF();
+				return;
+			}
+			iss >> session;
+			char *intervalEnd = 0x00;
+			double intervalSeconds = strtod(intervalText.c_str(), &intervalEnd);
+			if ( intervalEnd == intervalText.c_str() || '\0' != *intervalEnd ) {
+				printf("Timelapse status=error reason=bad-interval interval=%s\n", intervalText.c_str());
+				FF();
+				return;
+			}
+			startTimelapse(intervalSeconds, trimControlString(session));
+			return;
+		}
+		printf("Timelapse status=error reason=bad-action action=%s\n", action.c_str());
+		FF();
+		return;
+	}
+	if ( command == "record" ) {
+		recording( ptf, 0 );
+		threadData.configurationChanged++;
+		return;
+	}
+	if ( command == "reset" ) {
+		processKeypress( '5', ptf, frame );
+		return;
+	}
+	if ( command == "quit" || command == "exit" ) {
+		threadData.running = 0;
+		return;
+	}
+	if ( command == "preset" ) {
+		std::string preset;
+		iss >> preset;
+		setRuntimePreset( ptf, preset );
+		return;
+	}
+	if ( command == "perf-reset" || command == "benchmark-reset" ) {
+		resetPerfCountersRequested = 1;
+		return;
+	}
+	if ( command == "calibrate" || command == "calibration" ) {
+		parseBlackbodyCalibrationCommand( iss, true );
+		return;
+	}
+	if ( command == "blackbody" || command == "blackbody-calibrate" || command == "blackbody-calibration" ) {
+		parseBlackbodyCalibrationCommand( iss, false );
+		return;
+	}
+	if ( command != "set" ) {
+		return;
+	}
+
+	std::string key;
+	iss >> key;
+	key = lowerControlString( key );
+	std::string value;
+	std::getline( iss, value );
+	value = trimControlString( value );
+	std::string lowerValue = lowerControlString( value );
+
+	if ( key == "scale" || key == "display-scale" || key == "superres" || key == "super-resolution" ) {
+		setRuntimeScale( ptf, parseScaleValue( value.c_str() ) );
+	} else if ( key == "rotation" || key == "rotate" ) {
+		setRuntimeRotation( ptf, atoi( value.c_str() ) );
+	} else if ( key == "fullscreen" ) {
+		setRuntimeFullscreen( ptf, parseControlBool( lowerValue ) );
+	} else if ( key == "hud" || key == "info-overlay" || key == "status-overlay" ) {
+		// The GUI exposes this as the complete display-overlay switch.
+		// Off must produce a clean image, not merely hide the three-line HUD.
+		controls.hud = parseControlBool( lowerValue ) ? HUD_HUD : HUD_ONLY_VIDEO;
+		controls.lastHelpScale = -1;
+		threadData.configurationChanged++;
+	} else if ( key == "interp" || key == "interpolation" ) {
+		int index = parseInterpolationIndex( value.c_str() );
+		if ( 0 <= index ) {
+			controls.inters = index;
+			threadData.configurationChanged++;
+		}
+	} else if ( key == "ai-superres" || key == "ai-sr" || key == "superres-ai" || key == "aisr" ) {
+		setRuntimeAiSuperResMode( lowerValue );
+	} else if ( key == "cmap" || key == "colormap" ) {
+		controls.cmapCurrent = abs( atoi( value.c_str() ) ) % MAX_CMAPS;
+		threadData.configurationChanged++;
+	} else if ( key == "unit" || key == "temp-unit" || key == "temperature-unit" ) {
+		if ( lowerValue == "c" || lowerValue == "celsius" ) {
+			setTemperatureUnitCelsius( true );
+		} else if ( lowerValue == "f" || lowerValue == "fahrenheit" ) {
+			setTemperatureUnitCelsius( false );
+		}
+	} else if ( key == "offset" || key == "temp-offset-c" || key == "offset-c" ) {
+		temperatureOffsetCelsius = (float)atof( value.c_str() );
+		resetAutoRangeExtrema();
+		threadData.configurationChanged++;
+	} else if ( key == "drift" || key == "temp-drift-c-per-min" || key == "drift-c-per-min" ) {
+		temperatureDriftCelsiusPerMinute = (float)atof( value.c_str() );
+		temperatureDriftStartMillis = currentTimeMillis();
+		resetAutoRangeExtrema();
+		threadData.configurationChanged++;
+	} else if ( key == "blur" || key == "box-blur" ) {
+		controls.rad = max( 0, atoi( value.c_str() ) );
+		threadData.configurationChanged++;
+	} else if ( key == "contrast" || key == "alpha" || key == "gain" ) {
+		controls.alpha = atof( value.c_str() );
+		if ( controls.alpha < 0.0 ) {
+			controls.alpha = 0.0;
+		} else if ( controls.alpha > MAX_ALPHA ) {
+			controls.alpha = MAX_ALPHA;
+		}
+		threadData.configurationChanged++;
+	} else if ( key == "filter" || key == "filter-preset" || key == "display-filter" ) {
+		setRuntimeDisplayLevel( controls.displayFilterPreset, lowerValue );
+	} else if ( key == "bilateral" ) {
+		setRuntimeDisplayLevel( controls.bilateralLevel, lowerValue );
+	} else if ( key == "temporal" || key == "temporal-denoise" ) {
+		int before = controls.temporalDenoiseLevel;
+		setRuntimeDisplayLevel( controls.temporalDenoiseLevel, lowerValue );
+		if ( before != controls.temporalDenoiseLevel ) {
+			resetDisplayTemporalDenoise();
+		}
+	} else if ( key == "sharpen" ) {
+		setRuntimeDisplayLevel( controls.sharpenLevel, lowerValue );
+	} else if ( key == "threshold" || key == "threshold-c" ) {
+		controls.threshold.celsius = max( 0.0f, (float)atof( value.c_str() ) );
+		threadData.configurationChanged++;
+	} else if ( key == "autorange" || key == "auto-range" ) {
+		setRuntimeAutoRange( atoi( value.c_str() ) );
+	} else if ( key == "mapping" || key == "mapping-filter" ) {
+		setRuntimeMappingFilter( atoi( value.c_str() ) );
+	} else if ( key == "manual-range" ) {
+		std::istringstream rangeStream( value );
+		std::string enabled;
+		float minC = controls.manualRangeMinC;
+		float maxC = controls.manualRangeMaxC;
+		rangeStream >> enabled >> minC >> maxC;
+		setRuntimeManualRange( parseControlBool( lowerControlString(enabled) ), minC, maxC );
+	} else if ( key == "manual-enabled" ) {
+		setRuntimeManualRange( parseControlBool( lowerValue ), controls.manualRangeMinC, controls.manualRangeMaxC );
+	} else if ( key == "manual-min-c" ) {
+		setRuntimeManualRange( controls.manualRangeEnabled, (float)atof( value.c_str() ), controls.manualRangeMaxC );
+	} else if ( key == "manual-max-c" ) {
+		setRuntimeManualRange( controls.manualRangeEnabled, controls.manualRangeMinC, (float)atof( value.c_str() ) );
+	} else if ( key == "roi" || key == "roi-mode" ) {
+		setRuntimeRoiMode( lowerValue );
+	} else if ( key == "roi-size" || key == "roi-rect-percent" ) {
+		controls.roiRectPercent = max( 5, min( 100, atoi( value.c_str() ) ) );
+		threadData.configurationChanged++;
+	} else if ( key == "rulers" || key == "ruler-mode" ) {
+		setRuntimeRulerMode( ptf, atoi( value.c_str() ) );
+	} else if ( key == "isotherm" || key == "overtemp" ) {
+		controls.isothermEnabled = parseControlBool( lowerValue ) ? 1 : 0;
+		threadData.configurationChanged++;
+	} else if ( key == "isotherm-threshold-c" || key == "overtemp-c" ) {
+		controls.isothermThresholdC = (float)atof( value.c_str() );
+		threadData.configurationChanged++;
+	} else if ( key == "histogram" ) {
+		Use_Histogram = parseControlBool( lowerValue ) ? 1 : 0;
+		threadData.configurationChanged++;
+	} else if ( key == "perf-reset" || key == "benchmark-reset" ) {
+		resetPerfCountersRequested = 1;
+	}
+}
+
+#ifdef _WIN32
+static HANDLE controlPipe = INVALID_HANDLE_VALUE;
+static bool controlPipeConnected = false;
+static std::string controlPipeBuffer;
+
+static std::string controlPipePath() {
+	if ( controlPipeName.empty() ) {
+		return "";
+	}
+	if ( controlPipeName.rfind("\\\\.\\pipe\\", 0) == 0 ) {
+		return controlPipeName;
+	}
+	return "\\\\.\\pipe\\" + controlPipeName;
+}
+
+static void closeRuntimeControlPipe() {
+	if ( INVALID_HANDLE_VALUE != controlPipe ) {
+		DisconnectNamedPipe( controlPipe );
+		CloseHandle( controlPipe );
+		controlPipe = INVALID_HANDLE_VALUE;
+	}
+	controlPipeConnected = false;
+	controlPipeBuffer.clear();
+}
+
+static void initRuntimeControlPipe() {
+	if ( controlPipeName.empty() ) {
+		return;
+	}
+	std::string path = controlPipePath();
+	controlPipe = CreateNamedPipeA(
+		path.c_str(),
+		PIPE_ACCESS_INBOUND,
+		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+		1,
+		4096,
+		4096,
+		0,
+		NULL );
+	if ( INVALID_HANDLE_VALUE == controlPipe ) {
+		printf("%sControl pipe create failed (%lu): %s\n%s", RED_STR(), GetLastError(), path.c_str(), RESET_STR());
+		return;
+	}
+	printf("Control pipe: %s\n", path.c_str());
+}
+
+static void pollRuntimeControlPipe( ProcessedThermalFrame *ptf, Mat *frame ) {
+	if ( INVALID_HANDLE_VALUE == controlPipe ) {
+		return;
+	}
+
+	if ( ! controlPipeConnected ) {
+		BOOL connected = ConnectNamedPipe( controlPipe, NULL );
+		DWORD err = GetLastError();
+		if ( connected || ERROR_PIPE_CONNECTED == err ) {
+			controlPipeConnected = true;
+		} else if ( ERROR_PIPE_LISTENING == err || ERROR_NO_DATA == err ) {
+			if ( ERROR_NO_DATA == err ) {
+				DisconnectNamedPipe( controlPipe );
+			}
+			return;
+		} else {
+			DisconnectNamedPipe( controlPipe );
+			return;
+		}
+	}
+
+	char buffer[512];
+	DWORD bytesRead = 0;
+	while ( ReadFile( controlPipe, buffer, sizeof(buffer), &bytesRead, NULL ) && bytesRead > 0 ) {
+		controlPipeBuffer.append( buffer, buffer + bytesRead );
+		size_t pos = 0;
+		while ( (pos = controlPipeBuffer.find('\n')) != std::string::npos ) {
+			std::string line = controlPipeBuffer.substr( 0, pos );
+			controlPipeBuffer.erase( 0, pos + 1 );
+			applyRuntimeControl( line, ptf, frame );
+		}
+		bytesRead = 0;
+	}
+
+	DWORD err = GetLastError();
+	if ( ERROR_NO_DATA == err ) {
+		return;
+	}
+	if ( ERROR_BROKEN_PIPE == err ) {
+		if ( ! controlPipeBuffer.empty() ) {
+			applyRuntimeControl( controlPipeBuffer, ptf, frame );
+			controlPipeBuffer.clear();
+		}
+		DisconnectNamedPipe( controlPipe );
+		controlPipeConnected = false;
+	}
+}
+#else
+static void initRuntimeControlPipe() {
+	if ( ! controlPipeName.empty() ) {
+		printf("Control pipe is only active on Windows builds.\n");
+	}
+}
+
+static void pollRuntimeControlPipe( ProcessedThermalFrame *, Mat * ) {
+}
+
+static void closeRuntimeControlPipe() {
+}
+#endif
 
 
 #if BORDER_LAYOUT
@@ -5130,9 +7463,9 @@ int mainPrivate (int argc, char *argv[]) {
 
 	// Mat frame;
 	// cv::Mat::Mat(int rows, int cols, int type)
-	Mat rawFrame(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used for FreezeFrame and to write .raw files
-	Mat tFrame_0(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used to facilitate camera connection recovery
-	Mat tFrame_1(FIXED_TC_HEIGHT * 2, FIXED_TC_WIDTH, CV_8UC2);   // Used to facilitate camera connection recovery
+	Mat rawFrame(RAW_TC_ROWS, FIXED_TC_WIDTH, CV_8UC2);              // Normalized frame used for FreezeFrame and .raw files
+	Mat tFrame_0(UTI260B_CAPTURE_ROWS, FIXED_TC_WIDTH, CV_8UC2);     // Capture buffer used to facilitate camera connection recovery
+	Mat tFrame_1(UTI260B_CAPTURE_ROWS, FIXED_TC_WIDTH, CV_8UC2);     // Capture buffer used to facilitate camera connection recovery
 	Mat rgbFrameOrig; // Scaled, rotated (not composited) RGB frame - COLOR_YUV2BR_YUYV
 	Mat rgbFrame;     // Scaled, rotated  and composited  RGB frame - COLOR_YUV2BR_YUYV
 
@@ -5161,6 +7494,7 @@ int mainPrivate (int argc, char *argv[]) {
 	int64_t startup1 = currentTimeMicros();
 
 	setDefaults( ptf );
+	temperatureDriftStartMillis = currentTimeMillis();
 
 	// (code that uses SSE4.2, AVX/AVX2, and other instructions on the platforms that support it)
 	cv::setUseOptimized( true ); // Make sure hardware optimization is enabled
@@ -5177,6 +7511,7 @@ int mainPrivate (int argc, char *argv[]) {
 		printUsage();
 		return -1;
 	}
+	initRuntimeControlPipe();
 
 	int64_t startup3 = currentTimeMicros();
 
@@ -5233,8 +7568,17 @@ int mainPrivate (int argc, char *argv[]) {
 	pthread_t imageThread;   pthread_create( &imageThread,   NULL, imageDataThread,   (void*) &threadData );
 	pthread_t thermalThread; pthread_create( &thermalThread, NULL, thermalDataThread, (void*) &threadData );
 #endif
-	// Read keyboard input from launching terminal or command file piped into stdin
-	pthread_t stdinThread;   pthread_create( &stdinThread,   NULL, stdinDataThread,   (void*) &threadData );
+	// Benchmark runs stop from frame count and should not keep a blocking stdin reader alive.
+#ifndef _WIN32
+	pthread_t stdinThread;
+	if ( benchmarkFrames <= 0 ) {
+		pthread_create( &stdinThread, NULL, stdinDataThread, (void*) &threadData );
+	}
+#else
+	// Windows uses the OpenCV window plus the named control pipe. The inherited
+	// console stdin reader blocks in fgets() and can deadlock MinGW CRT cleanup
+	// while the process exits, so do not create it on this platform.
+#endif
 
 	RenderData  rdMain;
 	Rect        osdROI;
@@ -5353,15 +7697,41 @@ int mainPrivate (int argc, char *argv[]) {
 				
 					int readError;
 					if (0 == lastGoodFrame) {
+#ifdef _WIN32
+						if ( windowsRawCapture.isOpened() ) {
+							readError = windowsRawCapture.read(tFrame_1) ? 0 : -1;
+						} else {
+							cap >> tFrame_1;
+							readError = normalizeRawFrame(tFrame_1, rawFrame);
+						}
+#else
 						cap >> tFrame_1;
-						readError     = tFrame_1.empty();
-						lastGoodFrame = readError ?        0 :        1;
-						rawFrame      = readError ? tFrame_0 : tFrame_1;
+						readError     = normalizeRawFrame(tFrame_1, rawFrame);
+#endif
+#ifdef _WIN32
+						if ( ! readError && windowsRawCapture.isOpened() ) {
+							readError = normalizeRawFrame(tFrame_1, rawFrame);
+						}
+#endif
+						lastGoodFrame = readError ? 0 : 1;
 					} else {
+#ifdef _WIN32
+						if ( windowsRawCapture.isOpened() ) {
+							readError = windowsRawCapture.read(tFrame_0) ? 0 : -1;
+						} else {
+							cap >> tFrame_0;
+							readError = normalizeRawFrame(tFrame_0, rawFrame);
+						}
+#else
 						cap >> tFrame_0;
-						readError     = tFrame_0.empty();
-						lastGoodFrame = readError ?        1 :        0;
-						rawFrame      = readError ? tFrame_1 : tFrame_0;
+						readError     = normalizeRawFrame(tFrame_0, rawFrame);
+#endif
+#ifdef _WIN32
+						if ( ! readError && windowsRawCapture.isOpened() ) {
+							readError = normalizeRawFrame(tFrame_0, rawFrame);
+						}
+#endif
+						lastGoodFrame = readError ? 1 : 0;
 					}
 
 					if ( readError ) {
@@ -5371,6 +7741,9 @@ int mainPrivate (int argc, char *argv[]) {
 						printf(RESET_STR());
 						if ( ! released ) {
 							cap.release();
+#ifdef _WIN32
+							windowsRawCapture.release();
+#endif
 							released = 1;
 						}
 						threadData.lostVideo   = 1;
@@ -5427,9 +7800,9 @@ int mainPrivate (int argc, char *argv[]) {
 		ASSERT((                     2 == rawFrame.channels() ))
 		ASSERT((                     2 == rawFrame.elemSize() ))
 		ASSERT((                     1 == rawFrame.elemSize1() ))
-		ASSERT(((size_t)(FIXED_TC_WIDTH*FIXED_TC_HEIGHT*2) == rawFrame.total() ))
+		ASSERT(((size_t)(FIXED_TC_WIDTH*RAW_TC_ROWS) == rawFrame.total() ))
 		ASSERT((  FIXED_TC_WIDTH       == rawFrame.cols ))
-		ASSERT(( (FIXED_TC_HEIGHT * 2) == rawFrame.rows ))   // 2 frames
+		ASSERT(( RAW_TC_ROWS           == rawFrame.rows ))   // 2 frames
 		ASSERT((  CV_8UC2              == rawFrame.type() )) // 2 channels of uint8
 		ASSERT((                     0 == rawFrame.depth() ))
 
@@ -5494,6 +7867,7 @@ int mainPrivate (int argc, char *argv[]) {
 
 			// Calc FPS
 			controls.frameCounter++;
+			benchmarkFrameCounter++;
 
 			int64_t now    = currentTimeMillis();
 			double seconds = (double)(now - controls.startMills) / (double)1000.0;
@@ -5603,16 +7977,24 @@ int mainPrivate (int argc, char *argv[]) {
 		}
 
 		// Worker threads should have finished processing sub-frames at this point.
-		// imageDataThread maybe recording the rgbFrame while main thread is showing the rgbFrame
+		// Main owns final overlay/display/recording before releasing workers to the next frame.
 		// thermalDataThread and imageDataThead are then on their way to blocking on state 0
 		// while this main thread is finishing with the current frame and providing the next frame.
 		// Their thread states should be 0, or 3 transitioning to 0
 
-//printf("%s(%d) - Parallel worker threads finished %ld\n", __func__, __LINE__, currentTimeMicros()); FF();
+	//printf("%s(%d) - Parallel worker threads finished %ld\n", __func__, __LINE__, currentTimeMicros()); FF();
 
-		TS( int64_t imshowMicros = currentTimeMicros(); )
+			TS( int64_t imshowMicros = currentTimeMicros(); )
+			Mat osdDisplayFrame;
+			Mat *displayOutputFrame = &rgbFrame;
 
-#if BORDER_LAYOUT
+			if ( HUD_ONLY_VIDEO != controls.hud ) {
+				pthread_mutex_lock( &videoOutMutex );
+				drawAnalysisOverlays( *threadData.rgbFrame, ptf );
+				pthread_mutex_unlock( &videoOutMutex );
+			}
+
+	#if BORDER_LAYOUT
 
 		{
 			// Render using squishy left and right borders.
@@ -5625,29 +8007,6 @@ int mainPrivate (int argc, char *argv[]) {
 			// Remove right border when double wide since cmap is over thermal window
 			// Squishy right border
 			copyMakeBorder( rgbFrame, borderFrame, 0, 0, leftBorderWidth, rightBorderWidth, BORDER_CONSTANT, 0 );
-
-			// Display either OSD Help or HUD, not both
-			if ( HUD_HELP == controls.hud ) {
-				roi.x = roi.y = 0;
-				// NOTE: Help is taller than 1X scale PORTRAIT Help
-				roi.width    = min( HelpWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HelpHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = borderFrame( roi ); // Grab pointer to section of image under HUD
-
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-
-			} else if ( HUD_HUD == controls.hud ) {
-				// Make HUD translucent
-				// Alpha blended HUD is CPU intensive, use smallest rectangle possible
-				roi.x = roi.y = 0;
-				roi.width    = min( HudWidth,  SCALED_TC_WIDTH  );
-				roi.height   = min( HudHeight, SCALED_TC_HEIGHT );
-				Mat frameROI = borderFrame( roi ); // Grab pointer to section of image under HUD
-
-				// Alpha blend with HUD
-				// Copy blended result back to same section of output frame
-				addWeighted( frameROI, 1-HUD_ALPHA, threadData.rgbHUD, HUD_ALPHA, 0.0, frameROI );
-			}
 
 			if ( HUD_ONLY_VIDEO != controls.hud ) {
 				{ // Draw opaque Colormap Gradient Scale
@@ -5685,24 +8044,48 @@ int mainPrivate (int argc, char *argv[]) {
 
 			pthread_mutex_unlock( &videoOutMutex );
 
-			imshow( WINDOW_NAME, borderFrame );
+			displayOutputFrame = &borderFrame;
+			if ( HUD_HELP == controls.hud || HUD_HUD == controls.hud ) {
+				osdDisplayFrame = borderFrame.clone();
+				blendDisplayOsd( osdDisplayFrame );
+				displayOutputFrame = &osdDisplayFrame;
+			}
+
+			writeRecordingFrame( ptf, *displayOutputFrame );
+			imshow( WINDOW_NAME, *displayOutputFrame );
 		}
 
 #else
-		// Show the composited frame while imageDataThread maybe recording same composited frame
-		imshow( WINDOW_NAME, rgbFrame );
+		if ( HUD_HELP == controls.hud || HUD_HUD == controls.hud ) {
+			osdDisplayFrame = rgbFrame.clone();
+			blendDisplayOsd( osdDisplayFrame );
+			displayOutputFrame = &osdDisplayFrame;
+		}
+		writeRecordingFrame( ptf, *displayOutputFrame );
+		imshow( WINDOW_NAME, *displayOutputFrame );
 #endif
 
 		TS( threadData.imshowMicros += ( currentTimeMicros() - imshowMicros ); ) // track relative benchmarks
 
-		~threadData.cmapScale;
-		~threadData.rgbHUD;
+		threadData.cmapScale.release();
+		threadData.rgbHUD.release();
 
 		TS( threadData.mainMicros += currentTimeMicros() - mainMicros; ) // track linear read and processing
 
-#define N_FRAMES (20.0 * 25.0) // Stat log average timings every N_FRAMES
+		int perfCountersWereReset = 0;
+		if ( resetPerfCountersRequested ) {
+			resetFrameCounter();
+			threadData.thermMicros = threadData.imageMicros = threadData.rotMicros    = 0;
+			threadData.horizMicros = threadData.vertMicros  = 0;
+			threadData.mainMicros  = threadData.readMicros  = threadData.imshowMicros = 0;
+			rdMain.renderMicros = 0;
+			resetPerfCountersRequested = 0;
+			perfCountersWereReset = 1;
+		}
 
-		if (0 == (controls.frameCounter % (long)N_FRAMES)) {
+#define N_FRAMES ((double)perfFrameInterval) // Stat log average timings every N_FRAMES
+
+		if ( ! perfCountersWereReset && 0 == (controls.frameCounter % perfFrameInterval)) {
 
 		    if ( ! quietStdout ) {
 
@@ -5745,6 +8128,7 @@ int mainPrivate (int argc, char *argv[]) {
 				threadData.horizMicros / 1000.0 / N_FRAMES, 
 				threadData.vertMicros  / 1000.0 / N_FRAMES
 				);
+			FF();
 		    }
 
 			threadData.thermMicros = threadData.imageMicros = threadData.rotMicros    = 0;
@@ -5765,18 +8149,25 @@ int mainPrivate (int argc, char *argv[]) {
 #if 0
 		int c = -1; // 686 FPS without waiting 1ms, doesn't render graphics
 #else
-		// Use following sleepMicros() to throttle FPS
-		int c = (char)waitKeyEx( 1 );
+			// Use following sleepMicros() to throttle FPS
+			int c = (char)waitKeyEx( 1 );
 #endif
-			
+
+			pollRuntimeControlPipe( ptf, displayOutputFrame );
+			if ( ! threadData.running ) {
+				break;
+			}
+			// A live setting command is applied after the current display frame
+			// has already been composed. Wait for the next rendered frame so
+			// the first timelapse image reflects the requested HUD/visual state.
+			if ( ! threadData.configurationChanged ) {
+				captureTimelapseFrameIfDue( displayOutputFrame );
+			}
+
                 if ( takeSnapshot ) {
                         printf("%s", GREEN_STR() );
                         printf("\nTaking snapshot and exiting\n");
-#if BORDER_LAYOUT
-                        snapshot( &borderFrame, snapshotPrefix ); // Snapshot
-#else
-                        snapshot( &rgbFrame, snapshotPrefix ); // Snapshot
-#endif
+                        snapshot( displayOutputFrame, snapshotPrefix ); // Snapshot
                         printf("%s", RESET_STR() );
                         goto SHUTDOWN;
                 }
@@ -5832,16 +8223,25 @@ int mainPrivate (int argc, char *argv[]) {
 			break;
 		}
 
+		if (0 < benchmarkFrames && benchmarkFrameCounter >= benchmarkFrames) {
+			break;
+		}
+
 	} // End for loop
 
-SHUTDOWN:
+	SHUTDOWN:
 
-	// Tell threads to exit
-	exitAllThreads();
+		closeRuntimeControlPipe();
+
+		// Tell threads to exit
+		exitAllThreads();
  
 	if ( ! released && ! threadData.inputFile ) {
 		// When everything done, release the video capture and write object
 		cap.release();
+#ifdef _WIN32
+		windowsRawCapture.release();
+#endif
 	}
 
 	if ( rawReadFp ) {

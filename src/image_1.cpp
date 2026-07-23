@@ -44,11 +44,23 @@
 
 			// Optimization: Cornercase for 1X scale.  Interpolation of 1:1 pixels does not make sense
 			if ( 1 < MyScale ) {
-				SIZE( size, controls.sW, controls.sH );
-				resize(*sourcePtr, *threadData.rgbFrameOrig, size,
-                       	              0.0, 0.0, // optional 0.0, 0.0 args is REQUIRED for Interpolation options to work
-                                     Inters[controls.inters].inter // INTER_CUBIC default
-                                ); // Scale up from native camera resolution
+				if ( WINDOW_DOUBLE_WIDE == controls.windowFormat ||
+				     WINDOW_DOUBLE_HIGH == controls.windowFormat ) {
+					Mat scaledImageFrame;
+					Mat scaledThermalFrame;
+					Size paneSize;
+					SIZE( paneSize, controls.scaledSFWidth, controls.scaledSFHeight );
+					upscaleDisplaySource( rgbImageFrame, scaledImageFrame, paneSize );
+					upscaleDisplaySource( rgbThermalFrame, scaledThermalFrame, paneSize );
+					if ( WINDOW_DOUBLE_WIDE == controls.windowFormat ) {
+						cv::hconcat( scaledImageFrame, scaledThermalFrame, *threadData.rgbFrameOrig );
+					} else {
+						cv::vconcat( scaledImageFrame, scaledThermalFrame, *threadData.rgbFrameOrig );
+					}
+				} else {
+					SIZE( size, controls.sW, controls.sH );
+					upscaleDisplaySource( *sourcePtr, *threadData.rgbFrameOrig, size );
+				}
 				useFrameOrig = 1;
 			}
 
@@ -62,6 +74,17 @@
 						*threadData.rgbFrameOrig, point );
 				useFrameOrig = 1;
                         }
+
+			if ( displayEnhancementsEnabled() ) {
+				if ( ! useFrameOrig ) {
+					*threadData.rgbFrameOrig = sourcePtr->clone();
+					useFrameOrig = 1;
+				}
+				if ( threadData.configurationChanged ) {
+					resetDisplayTemporalDenoise();
+				}
+				applyDisplayEnhancements( *threadData.rgbFrameOrig );
+			}
 
                         //  Colormaps do not support ALPHA/TRANSPARENTCIES
                         //  what():  OpenCV(4.5.1) ../modules/imgproc/src/colormap.cpp:736: error: (-5:Bad argument)
